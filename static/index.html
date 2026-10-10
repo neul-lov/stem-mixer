@@ -1,0 +1,422 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>노래 분리 믹서</title>
+<style>
+  :root {
+    --bg: #f6f6f4; --card: #ffffff; --text: #1d1d1f; --muted: #6e6e73; --line: #e3e3e0;
+    --accent: #5b5bd6; --accent-soft: #ececfb; --danger: #d4483b;
+    --vocals: #e5484d; --bass: #3e63dd; --drums: #f59e0b; --other: #30a46c;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #111113; --card: #1c1c1f; --text: #ededef; --muted: #9b9ba1; --line: #2e2e33;
+      --accent: #8b8bf5; --accent-soft: #26264a; --danger: #ff6b5e;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font-family: -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Malgun Gothic", "Segoe UI", sans-serif; }
+  main { max-width: 720px; margin: 0 auto; padding: 24px 16px 64px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  .sub { color: var(--muted); margin: 0 0 20px; font-size: 14px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 16px; padding: 20px; margin-bottom: 16px; }
+  .row { display: flex; gap: 8px; align-items: center; }
+  input[type=text] { flex: 1; min-width: 0; font: inherit; padding: 12px 14px; border-radius: 10px;
+                     border: 1px solid var(--line); background: var(--bg); color: var(--text); }
+  button { font: inherit; cursor: pointer; border-radius: 10px; border: 1px solid var(--line);
+           background: var(--card); color: var(--text); padding: 10px 14px; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  button:disabled { opacity: .5; cursor: default; }
+  .drop { margin-top: 10px; border: 2px dashed var(--line); border-radius: 12px; padding: 14px; text-align: center;
+          color: var(--muted); font-size: 14px; cursor: pointer; }
+  .drop.over { border-color: var(--accent); background: var(--accent-soft); }
+  .seg { display: inline-flex; background: var(--bg); border: 1px solid var(--line); border-radius: 10px; padding: 3px; margin-top: 12px; }
+  .seg button { border: 0; background: transparent; padding: 7px 12px; font-size: 14px; color: var(--muted); }
+  .seg button.on { background: var(--card); color: var(--text); box-shadow: 0 1px 3px rgba(0,0,0,.12); }
+  .hint { color: var(--muted); font-size: 13px; margin-top: 8px; }
+  .progress { margin-top: 14px; display: none; }
+  .bar { height: 8px; background: var(--line); border-radius: 99px; overflow: hidden; }
+  .bar > div { height: 100%; width: 0; background: var(--accent); transition: width .3s; }
+  .err { color: var(--danger); margin-top: 10px; font-size: 14px; display: none; }
+
+  #player { display: none; }
+  .title { font-weight: 700; font-size: 17px; margin-bottom: 14px; overflow-wrap: anywhere; }
+  .transport { display: flex; align-items: center; gap: 12px; }
+  .play { width: 52px; height: 52px; border-radius: 50%; background: var(--accent); border: 0; color: #fff;
+          font-size: 20px; flex: none; display: grid; place-items: center; padding: 0; }
+  .time { font-variant-numeric: tabular-nums; color: var(--muted); font-size: 13px; flex: none; }
+  input[type=range] { width: 100%; accent-color: var(--accent); }
+  .presets { display: flex; flex-wrap: wrap; gap: 6px; margin: 18px 0 6px; }
+  .presets button { padding: 7px 12px; font-size: 13px; border-radius: 99px; }
+  .presets button.on { background: var(--accent-soft); border-color: var(--accent); }
+  .track { display: grid; grid-template-columns: 92px 1fr 56px auto; gap: 10px; align-items: center;
+           padding: 12px 0; border-top: 1px solid var(--line); }
+  .track:first-of-type { border-top: 0; }
+  .tname { display: flex; align-items: center; gap: 8px; font-weight: 600; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; flex: none; }
+  .pct { font-variant-numeric: tabular-nums; text-align: right; font-weight: 600; }
+  .pct.zero { color: var(--muted); }
+  .tbtns { display: flex; gap: 4px; }
+  .tbtns button { padding: 5px 8px; font-size: 12px; min-width: 34px; }
+  .tbtns button.on.m { background: var(--danger); border-color: var(--danger); color: #fff; }
+  .tbtns button.on.s { background: var(--drums); border-color: var(--drums); color: #000; }
+  .track.silent .tname, .track.silent input { opacity: .4; }
+  .meter { height: 4px; border-radius: 99px; background: var(--line); grid-column: 2 / 3; margin-top: -6px; overflow: hidden; }
+  .meter > div { height: 100%; width: 0; }
+  .foot { display: flex; gap: 8px; justify-content: space-between; align-items: center; margin-top: 14px; flex-wrap: wrap; }
+  .master { display: flex; align-items: center; gap: 8px; flex: 1; min-width: 200px; font-size: 14px; color: var(--muted); white-space: nowrap; }
+  .loading { color: var(--muted); font-size: 14px; padding: 8px 0; }
+
+  .lib-item { display: flex; align-items: center; gap: 10px; padding: 10px 0; border-top: 1px solid var(--line); }
+  .lib-item:first-child { border-top: 0; }
+  .lib-item .name { flex: 1; min-width: 0; cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .lib-item .name:hover { color: var(--accent); }
+  .tag { font-size: 11px; color: var(--muted); border: 1px solid var(--line); border-radius: 99px; padding: 2px 8px; flex: none; }
+  .lib-item button { padding: 4px 8px; font-size: 12px; color: var(--muted); }
+  h2 { font-size: 15px; margin: 0 0 8px; }
+  .keys { color: var(--muted); font-size: 12px; margin-top: 10px; }
+
+  @media (max-width: 520px) {
+    .track { grid-template-columns: 1fr 52px auto; }
+    .track input[type=range] { grid-column: 1 / -1; grid-row: 2; }
+    .meter { display: none; }
+  }
+</style>
+</head>
+<body>
+<main>
+  <h1>노래 분리 믹서</h1>
+  <p class="sub">유튜브 링크나 음악 파일을 넣으면 보컬, 베이스, 드럼, 기타 악기를 따로 조절할 수 있어요.</p>
+
+  <section class="card">
+    <form id="form" class="row">
+      <input id="url" type="text" placeholder="유튜브 · 스포티파이 · 애플뮤직 링크나 곡 제목" autocomplete="off">
+      <button id="go" class="primary" type="submit">분리하기</button>
+    </form>
+    <div id="drop" class="drop">또는 여기에 음악 파일을 끌어다 놓거나 <u>눌러서 선택</u> (mp3, wav, m4a 등)</div>
+    <input id="file" type="file" accept="audio/*,video/*" hidden>
+    <div class="seg" id="mode">
+      <button type="button" data-mode="ai" class="on">고음질 (AI)</button>
+      <button type="button" data-mode="ai6">AI 6트랙 (기타·피아노)</button>
+      <button type="button" data-mode="eq">빠르게 (주파수 필터)</button>
+    </div>
+    <div class="hint" id="modeHint">AI가 악기 소리를 학습해서 깔끔하게 나눠요. 한 곡에 1~5분 정도 걸려요.</div>
+    <div class="progress" id="progress">
+      <div class="row" style="justify-content:space-between;margin-bottom:6px;font-size:14px">
+        <span id="step">준비 중</span><span id="pctTxt"></span>
+      </div>
+      <div class="bar"><div id="barFill"></div></div>
+    </div>
+    <div class="err" id="err"></div>
+  </section>
+
+  <section class="card" id="player">
+    <div class="title" id="songTitle"></div>
+    <div class="loading" id="loadingTracks">트랙 불러오는 중...</div>
+    <div id="playerBody" style="display:none">
+      <div class="transport">
+        <button class="play" id="playBtn" aria-label="재생">▶</button>
+        <span class="time" id="cur">0:00</span>
+        <input type="range" id="seek" min="0" max="1000" value="0" aria-label="재생 위치">
+        <span class="time" id="dur">0:00</span>
+      </div>
+      <div class="presets" id="presets"></div>
+      <div id="tracks"></div>
+      <div class="foot">
+        <label class="master">전체 음량 <input type="range" id="master" min="0" max="100" value="80"></label>
+        <button id="exportBtn">이 설정으로 저장 (wav)</button>
+      </div>
+      <div class="keys">단축키: 스페이스 재생/정지 · ←/→ 5초 이동 · 1 보컬만 · 2 베이스만 · 3 드럼만 · 0 원곡</div>
+    </div>
+  </section>
+
+  <section class="card" id="libCard" style="display:none">
+    <h2>최근 분리한 곡</h2>
+    <div id="lib"></div>
+  </section>
+</main>
+
+<script>
+const STEM_INFO = {
+  vocals: { label: "보컬", color: "var(--vocals)" },
+  bass:   { label: "베이스", color: "var(--bass)" },
+  drums:  { label: "드럼", color: "var(--drums)" },
+  guitar: { label: "기타", color: "#8b5cf6" },
+  piano:  { label: "피아노", color: "#12a6bf" },
+  other:  { label: "나머지 악기", color: "var(--other)" },
+};
+const PRESETS = [
+  { name: "원곡",        v: { vocals: 100, bass: 100, drums: 100, other: 100 } },
+  { name: "노래방 (보컬 끄기)", v: { vocals: 0,   bass: 100, drums: 100, other: 100 } },
+  { name: "보컬만",      v: { vocals: 100 }, rest: 0 },
+  { name: "베이스만",    v: { bass: 100 }, rest: 0 },
+  { name: "드럼만",      v: { drums: 100 }, rest: 0 },
+  { name: "베이스 연습", v: { vocals: 40,  bass: 0,   drums: 100 }, rest: 60 },
+  { name: "베이스 크게", v: { vocals: 60,  bass: 180, drums: 80 }, rest: 60 },
+];
+const $ = (id) => document.getElementById(id);
+const store = {
+  get(k) { try { return JSON.parse(localStorage.getItem(k)); } catch { return null; } },
+  set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} },
+};
+
+// ------------------------------------------------------------ 입력 & 분리 요청
+let mode = store.get("mode") || "ai";
+const HINTS = {
+  ai: "AI가 악기 소리를 학습해서 깔끔하게 나눠요. 한 곡에 1~5분 정도 걸려요.",
+  ai6: "보컬·베이스·드럼에 기타·피아노까지 6개로 나눠요. 피아노는 다른 소리가 조금 섞일 수 있어요.",
+  eq: "주파수 대역으로만 잘라서 몇 초면 끝나요. 대신 다른 악기 소리가 섞여 들려요.",
+};
+function setMode(m) {
+  mode = m; store.set("mode", m);
+  document.querySelectorAll("#mode button").forEach(b => b.classList.toggle("on", b.dataset.mode === m));
+  $("modeHint").textContent = HINTS[m];
+}
+document.querySelectorAll("#mode button").forEach(b => b.onclick = () => setMode(b.dataset.mode));
+setMode(mode);
+
+$("form").onsubmit = (e) => {
+  e.preventDefault();
+  const url = $("url").value.trim();
+  if (!url) { showErr("유튜브 링크를 붙여넣거나 파일을 선택해 주세요."); return; }
+
+  const fd = new FormData(); fd.append("url", url); fd.append("mode", mode);
+  submit(fd);
+};
+$("drop").onclick = () => $("file").click();
+$("file").onchange = () => { if ($("file").files[0]) sendFile($("file").files[0]); };
+["dragenter", "dragover"].forEach(t => $("drop").addEventListener(t, e => { e.preventDefault(); $("drop").classList.add("over"); }));
+["dragleave", "drop"].forEach(t => $("drop").addEventListener(t, e => { e.preventDefault(); $("drop").classList.remove("over"); }));
+$("drop").addEventListener("drop", e => { const f = e.dataTransfer.files[0]; if (f) sendFile(f); });
+// 페이지 아무 데나 유튜브 링크를 붙여넣어도 바로 입력되게
+document.addEventListener("paste", e => {
+  if (document.activeElement === $("url")) return;
+  const t = e.clipboardData.getData("text");
+  if (/youtu\.?be|spotify|music\.apple|soundcloud/.test(t)) { $("url").value = t.trim(); $("url").focus(); }
+});
+
+function sendFile(f) {
+  const fd = new FormData(); fd.append("file", f); fd.append("mode", mode);
+  submit(fd);
+}
+function showErr(msg) { $("err").textContent = msg; $("err").style.display = msg ? "block" : "none"; }
+function setBusy(b) { $("go").disabled = b; $("drop").style.pointerEvents = b ? "none" : ""; }
+
+async function submit(fd) {
+  showErr(""); setBusy(true);
+  $("progress").style.display = "block"; $("step").textContent = "보내는 중"; $("barFill").style.width = "0";
+  try {
+    const r = await fetch("/api/jobs", { method: "POST", body: fd });
+    if (!r.ok) throw new Error((await r.json()).detail || "요청 실패");
+    const { job_id } = await r.json();
+    poll(job_id);
+  } catch (e) { fail(e.message); }
+}
+async function poll(id) {
+  try {
+    const j = await (await fetch(`/api/jobs/${id}`)).json();
+    if (j.status === "error") return fail(j.error);
+    $("step").textContent = j.step;
+    const p = Math.round((j.progress || 0) * 100);
+    $("barFill").style.width = p + "%"; $("pctTxt").textContent = p ? p + "%" : "";
+    if (j.status === "done") {
+      setBusy(false); $("progress").style.display = "none"; $("url").value = "";
+      loadLibrary(); openSong(j.song_id);
+    } else setTimeout(() => poll(id), 700);
+  } catch { setTimeout(() => poll(id), 1500); }
+}
+function fail(msg) {
+  setBusy(false); $("progress").style.display = "none";
+  showErr("분리하지 못했어요: " + msg);
+}
+
+// ------------------------------------------------------------ 오디오 엔진
+const ctx = new (window.AudioContext || window.webkitAudioContext)();
+const masterGain = ctx.createGain(); masterGain.connect(ctx.destination);
+let song = null;              // { id, title, duration, stems }
+let tracks = {};              // name -> { buffer, gain, analyser, vol, mute, solo, source }
+let playing = false, startAt = 0, offset = 0, loadToken = 0;
+
+function now() { return playing ? Math.min(ctx.currentTime - startAt, song.duration) : offset; }
+
+function start(from) {
+  stopSources();
+  offset = Math.max(0, Math.min(from, song.duration));
+  const t0 = ctx.currentTime + 0.05;
+  for (const t of Object.values(tracks)) {
+    const s = ctx.createBufferSource(); s.buffer = t.buffer; s.connect(t.gain); s.start(t0, offset);
+    t.source = s;
+  }
+  startAt = t0 - offset; playing = true; $("playBtn").textContent = "❚❚";
+}
+function stopSources() {
+  for (const t of Object.values(tracks)) { if (t.source) { try { t.source.stop(); } catch {} t.source = null; } }
+}
+function pause() { offset = now(); stopSources(); playing = false; $("playBtn").textContent = "▶"; }
+function toggle() { if (!song) return; ctx.resume(); playing ? pause() : start(offset >= song.duration - 0.1 ? 0 : offset); }
+function seek(t) { playing ? start(t) : (offset = Math.max(0, Math.min(t, song.duration))); drawTime(); }
+
+function applyGains() {
+  const anySolo = Object.values(tracks).some(t => t.solo);
+  for (const [name, t] of Object.entries(tracks)) {
+    const audible = !t.mute && (!anySolo || t.solo);
+    t.gain.gain.setTargetAtTime(audible ? t.vol / 100 : 0, ctx.currentTime, 0.02);
+    const row = $("row-" + name);
+    row.classList.toggle("silent", !audible);
+    row.querySelector(".m").classList.toggle("on", t.mute);
+    row.querySelector(".s").classList.toggle("on", t.solo);
+    row.querySelector("input").value = t.vol;
+    const pct = row.querySelector(".pct"); pct.textContent = t.vol + "%"; pct.classList.toggle("zero", t.vol === 0);
+  }
+  // 현재 상태와 일치하는 프리셋 표시
+  document.querySelectorAll("#presets button").forEach((b, i) => {
+    b.classList.toggle("on", !anySolo && Object.entries(tracks).every(([n, t]) => !t.mute && t.vol === presetVol(i, n)));
+  });
+  if (song) store.set("mix:" + song.id, Object.fromEntries(Object.entries(tracks).map(([n, t]) => [n, t.vol])));
+}
+
+async function openSong(id) {
+  const token = ++loadToken;
+  if (playing) pause();
+  stopSources(); tracks = {}; offset = 0;
+  song = await (await fetch(`/api/songs/${id}`)).json();
+  $("player").style.display = "block"; $("playerBody").style.display = "none"; $("loadingTracks").style.display = "block";
+  $("songTitle").textContent = song.title + (song.mode === "eq" ? "  ·  빠른 모드" : "");
+  $("player").scrollIntoView({ behavior: "smooth", block: "start" });
+  const buffers = await Promise.all(song.stems.map(async n =>
+    ctx.decodeAudioData(await (await fetch(`/api/songs/${id}/${n}.wav`)).arrayBuffer())));
+  if (token !== loadToken) return;  // 그 사이 다른 곡을 열었으면 무시
+  const saved = store.get("mix:" + id) || {};
+  $("tracks").innerHTML = "";
+  song.stems.forEach((n, i) => {
+    const gain = ctx.createGain(), analyser = ctx.createAnalyser();
+    analyser.fftSize = 512; gain.connect(analyser); gain.connect(masterGain);
+    tracks[n] = { buffer: buffers[i], gain, analyser, vol: saved[n] ?? 100, mute: false, solo: false, source: null };
+    const info = STEM_INFO[n] || { label: n, color: "var(--muted)" };
+    const row = document.createElement("div");
+    row.className = "track"; row.id = "row-" + n;
+    row.innerHTML = `
+      <div class="tname"><span class="dot" style="background:${info.color}"></span>${info.label}</div>
+      <input type="range" min="0" max="200" step="5" value="100" aria-label="${info.label} 음량">
+      <div class="pct">100%</div>
+      <div class="tbtns"><button class="m" title="음소거">끄기</button><button class="s" title="이 트랙만 듣기">솔로</button></div>
+      <div class="meter"><div style="background:${info.color}"></div></div>`;
+    row.querySelector("input").oninput = e => { tracks[n].vol = +e.target.value; applyGains(); };
+    row.querySelector("input").ondblclick = () => { tracks[n].vol = 100; applyGains(); };
+    row.querySelector(".m").onclick = () => { tracks[n].mute = !tracks[n].mute; applyGains(); };
+    row.querySelector(".s").onclick = () => { tracks[n].solo = !tracks[n].solo; applyGains(); };
+    $("tracks").appendChild(row);
+  });
+  $("dur").textContent = fmt(song.duration);
+  $("loadingTracks").style.display = "none"; $("playerBody").style.display = "block";
+  applyGains(); drawTime();
+}
+
+function presetVol(i, n) { return PRESETS[i].v[n] ?? PRESETS[i].rest ?? 100; }
+function setPreset(i) {
+  for (const [n, t] of Object.entries(tracks)) { t.vol = presetVol(i, n); t.mute = false; t.solo = false; }
+  applyGains();
+}
+PRESETS.forEach((p, i) => {
+  const b = document.createElement("button"); b.textContent = p.name; b.onclick = () => setPreset(i);
+  $("presets").appendChild(b);
+});
+
+$("playBtn").onclick = toggle;
+let seeking = false;
+$("seek").oninput = () => { seeking = true; $("cur").textContent = fmt($("seek").value / 1000 * song.duration); };
+$("seek").onchange = () => { seeking = false; seek($("seek").value / 1000 * song.duration); };
+$("master").oninput = e => { masterGain.gain.value = (e.target.value / 100) ** 2; store.set("master", +e.target.value); };
+$("master").value = store.get("master") ?? 80; $("master").oninput({ target: $("master") });
+
+document.addEventListener("keydown", e => {
+  if (!song || e.target.tagName === "INPUT" && e.target.type === "text") return;
+  if (e.code === "Space") { e.preventDefault(); toggle(); }
+  else if (e.key === "ArrowRight") { e.preventDefault(); seek(now() + 5); }
+  else if (e.key === "ArrowLeft") { e.preventDefault(); seek(now() - 5); }
+  else if (/^[1-3]$/.test(e.key)) setPreset(+e.key + 1);   // 1 보컬만, 2 베이스만, 3 드럼만
+  else if (e.key === "0") setPreset(0);
+});
+
+function fmt(s) { s = Math.max(0, s | 0); return `${(s / 60) | 0}:${String(s % 60).padStart(2, "0")}`; }
+function drawTime() {
+  if (!song) return;
+  const t = now();
+  if (!seeking) { $("seek").value = (t / song.duration) * 1000; $("cur").textContent = fmt(t); }
+}
+const meterBuf = new Uint8Array(512);
+(function loop() {
+  if (song && playing) {
+    drawTime();
+    if (now() >= song.duration) { pause(); offset = 0; drawTime(); }
+    for (const [n, t] of Object.entries(tracks)) {
+      t.analyser.getByteTimeDomainData(meterBuf);
+      let peak = 0; for (const v of meterBuf) peak = Math.max(peak, Math.abs(v - 128));
+      const el = document.querySelector(`#row-${n} .meter > div`); if (el) el.style.width = Math.min(100, peak / 128 * 140) + "%";
+    }
+  } else if (song) document.querySelectorAll(".meter > div").forEach(el => el.style.width = "0");
+  requestAnimationFrame(loop);
+})();
+
+// ------------------------------------------------------------ 현재 믹스를 파일로 저장
+$("exportBtn").onclick = async () => {
+  const b = $("exportBtn"); b.disabled = true; b.textContent = "만드는 중...";
+  try {
+    const sr = Object.values(tracks)[0].buffer.sampleRate;
+    const len = Object.values(tracks)[0].buffer.length;
+    const off = new OfflineAudioContext(2, len, sr);
+    const anySolo = Object.values(tracks).some(t => t.solo);
+    for (const t of Object.values(tracks)) {
+      const g = off.createGain(); g.gain.value = (!t.mute && (!anySolo || t.solo)) ? t.vol / 100 : 0;
+      const s = off.createBufferSource(); s.buffer = t.buffer; s.connect(g); g.connect(off.destination); s.start();
+    }
+    const out = await off.startRendering();
+    const blob = toWav(out);
+    const a = document.createElement("a");
+    const desc = Object.entries(tracks).map(([n, t]) => `${STEM_INFO[n].label}${t.vol}`).join("_");
+    a.href = URL.createObjectURL(blob); a.download = `${song.title}_${desc}.wav`;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+  } finally { b.disabled = false; b.textContent = "이 설정으로 저장 (wav)"; }
+};
+function toWav(buf) {
+  const ch = buf.numberOfChannels, n = buf.length, data = new DataView(new ArrayBuffer(44 + n * ch * 2));
+  const w = (o, s) => [...s].forEach((c, i) => data.setUint8(o + i, c.charCodeAt(0)));
+  w(0, "RIFF"); data.setUint32(4, 36 + n * ch * 2, true); w(8, "WAVEfmt ");
+  data.setUint32(16, 16, true); data.setUint16(20, 1, true); data.setUint16(22, ch, true);
+  data.setUint32(24, buf.sampleRate, true); data.setUint32(28, buf.sampleRate * ch * 2, true);
+  data.setUint16(32, ch * 2, true); data.setUint16(34, 16, true); w(36, "data"); data.setUint32(40, n * ch * 2, true);
+  const chans = [...Array(ch)].map((_, i) => buf.getChannelData(i));
+  let p = 44;
+  for (let i = 0; i < n; i++) for (let c = 0; c < ch; c++) {
+    const v = Math.max(-1, Math.min(1, chans[c][i])); data.setInt16(p, v < 0 ? v * 0x8000 : v * 0x7fff, true); p += 2;
+  }
+  return new Blob([data], { type: "audio/wav" });
+}
+
+// ------------------------------------------------------------ 라이브러리
+async function loadLibrary() {
+  const songs = await (await fetch("/api/songs")).json();
+  $("libCard").style.display = songs.length ? "block" : "none";
+  $("lib").innerHTML = "";
+  for (const s of songs) {
+    const el = document.createElement("div"); el.className = "lib-item";
+    el.innerHTML = `<span class="name"></span><span class="tag">${{ ai: "AI", ai6: "AI 6트랙", eq: "빠른 모드" }[s.mode] || s.mode} · ${fmt(s.duration)}</span><button>삭제</button>`;
+    el.querySelector(".name").textContent = s.title;
+    el.querySelector(".name").onclick = () => openSong(s.id);
+    el.querySelector("button").onclick = async () => {
+      if (!confirm(`'${s.title}'을(를) 목록에서 지울까요?`)) return;
+      await fetch(`/api/songs/${s.id}`, { method: "DELETE" });
+      if (song && song.id === s.id) { if (playing) pause(); song = null; $("player").style.display = "none"; }
+      loadLibrary();
+    };
+    $("lib").appendChild(el);
+  }
+}
+loadLibrary();
+</script>
+</body>
+</html>

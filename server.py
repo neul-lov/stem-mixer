@@ -1,0 +1,373 @@
+"""노래 분리 믹서 서버.
+
+유튜브 링크나 오디오 파일을 받아 보컬 / 베이스 / 드럼 / 기타 트랙으로 나누고,
+브라우저 화면(static/index.html)에서 트랙별 음량을 조절할 수 있게 해 줍니다.
+실행: python server.py  →  http://localhost:8000
+"""
+import hashlib
+import json
+import re
+import shutil
+import subprocess
+import threading
+import traceback
+import urllib.request
+import uuid
+import webbrowser
+from pathlib import Path
+
+import imageio_ffmpeg
+import numpy as np
+import soundfile as sf
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+from scipy.signal import butter, sosfiltfilt
+
+ROOT = Path(__file__).parent
+LIBRARY = ROOT / "library"  # 분리된 곡이 쌓이는 곳 (곡마다 폴더 하나)
+LIBRARY.mkdir(exist_ok=True)
+FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()  # ffmpeg 따로 설치할 필요 없음
+SR = 44100
+STEMS = ["vocals", "bass", "drums", "other"]
+STEMS_6 = ["vocals", "bass", "drums", "guitar", "piano", "other"]  # ai6 모드 (기타·피아노 추가)
+MODELS = {"ai": "htdemucs", "ai6": "htdemucs_6s"}
+
+app = FastAPI()
+jobs = {}  # job_id -> {"status", "step", "progress", "song_id", "error"}
+work_lock = threading.Lock()  # 분리는 한 번에 한 곡씩 (메모리 보호)
+_models = {}  # 모드 -> 불러온 Demucs 모델
+
+
+# ---------------------------------------------------------------- 입력 받기
+UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
+      "(KHTML, like Gecko) Version/17.0 Safari/605.1.15")
+
+
+# 유튜브는 자바스크립트 실행기가 있어야 잘 받아진다. 앱으로 켜면 PATH가 짧아서 직접 찾는다.
+NODE = shutil.which("node") or next(
+    (p for p in ("/opt/homebrew/bin/node", "/usr/local/bin/node") if Path(p).exists()), None)
+YDL_BASE = {"quiet": True, "noplaylist": True, **({"js_runtimes": {"node": {"path": NODE}}} if NODE else {})}
+
+
+class UserError(Exception):
+    """사용자에게 그대로 보여 줄 메시지."""
+
+
+def youtube_id(url):
+    m = re.search(r"(?:v=|youtu\.be/|shorts/|embed/)([\w-]{11})", url)
+    return m.group(1) if m else None
+
+
+def _get(url):
+    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept-Language": "ko,en;q=0.8"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return r.read().decode("utf-8", "replace")
+
+
+def spotify_track(url):
+    """스포티파이 곡 링크 → (아티스트, 제목, 길이초). 음원은 DRM이라 정보만 가져온다."""
+    m = re.search(r"open\.spotify\.com/(?:intl-\w+/)?(\w+)/(\w{22})", url)
+    if not m:
+        raise UserError("스포티파이 링크를 읽지 못했어요.")
+    kind, tid = m.groups()
+    if kind != "track":
+        raise UserError("스포티파이는 곡 링크만 돼요 (앨범·플레이리스트 말고 곡 하나의 '공유 → 링크 복사').")
+    try:
+        html = _get(f"https://open.spotify.com/embed/track/{tid}")
+        data = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.S).group(1)
+        e = json.loads(data)["props"]["pageProps"]["state"]["data"]["entity"]
+        artist = ", ".join(a["name"] for a in e.get("artists", []))
+        return artist, e.get("name") or e.get("title"), (e.get("duration") or 0) / 1000, f"sp-{tid}"
+    except Exception:
+        o = json.loads(_get(f"https://open.spotify.com/oembed?url=https://open.spotify.com/track/{tid}"))
+        return "", o["title"], 0, f"sp-{tid}"
+
+
+def apple_track(url):
+    """애플뮤직 곡 링크 → (아티스트, 제목, 길이초). iTunes 검색 API 사용."""
+    m = re.search(r"[?&]i=(\d+)", url) or re.search(r"/song/(?:[^/]+/)?(\d+)", url)
+    if not m:
+        raise UserError("애플뮤직은 곡 링크만 돼요 (곡 옆 ··· → 공유 → 링크 복사).")
+    cc = re.search(r"music\.apple\.com/(\w\w)/", url)
+    q = f"https://itunes.apple.com/lookup?id={m.group(1)}&country={cc.group(1) if cc else 'kr'}"
+    res = [t for t in json.loads(_get(q)).get("results") or [] if t.get("kind") == "song"]
+    if not res:
+        raise UserError("애플뮤직에서 곡 정보를 찾지 못했어요.")
+    t = res[0]
+    return t["artistName"], t["trackName"], (t.get("trackTimeMillis") or 0) / 1000, f"am-{m.group(1)}"
+
+
+def find_on_youtube(artist, title, duration, job):
+    """제목·가수로 유튜브를 검색해서 길이가 가장 비슷한 영상을 고른다."""
+    import yt_dlp
+
+    job["step"] = f"유튜브에서 '{artist + ' - ' if artist else ''}{title}' 찾는 중"
+    query = f"{artist} {title} audio".strip()
+    with yt_dlp.YoutubeDL({**YDL_BASE, "extract_flat": True}) as ydl:
+        entries = [e for e in (ydl.extract_info(f"ytsearch6:{query}", download=False).get("entries") or [])
+                   if e.get("id")]
+    if not entries:
+        raise UserError("유튜브에서 이 곡을 찾지 못했어요.")
+    if duration:
+        close = [e for e in entries if e.get("duration") and abs(e["duration"] - duration) <= 8]
+        best = close[0] if close else min(
+            entries, key=lambda e: abs((e.get("duration") or 1e9) - duration))
+    else:
+        best = entries[0]
+    return f"https://www.youtube.com/watch?v={best['id']}"
+
+
+def resolve(text, job):
+    """입력(링크나 검색어)을 → (yt-dlp로 받을 주소, 보여 줄 제목, 캐시 키, 출처, 원래 정보)."""
+    low = text.lower()
+    if "spotify.com" in low or "spotify.link" in low:
+        if "spotify.link" in low:  # 짧은 링크는 펼친다
+            text = urllib.request.urlopen(urllib.request.Request(text, headers={"User-Agent": UA}), timeout=15).url
+        job["step"] = "스포티파이에서 곡 정보 읽는 중"
+        artist, title, dur, key = spotify_track(text)
+        return find_on_youtube(artist, title, dur, job), " - ".join(filter(None, [artist, title])), key, "spotify"
+    if "music.apple.com" in low or "itunes.apple.com" in low:
+        job["step"] = "애플뮤직에서 곡 정보 읽는 중"
+        artist, title, dur, key = apple_track(text)
+        return find_on_youtube(artist, title, dur, job), f"{artist} - {title}", key, "apple"
+    if re.match(r"https?://", low):
+        yid = youtube_id(text)
+        if yid:
+            return text, None, yid, "youtube"
+        src = "soundcloud" if "soundcloud.com" in low else "web"
+        return text, None, hashlib.sha1(text.encode()).hexdigest()[:11], src
+    # 링크가 아니면 곡 제목으로 검색
+    url = find_on_youtube("", text, 0, job)
+    return url, None, youtube_id(url), "search"
+
+
+def download(url, dest, job):
+    import yt_dlp
+
+    def hook(d):
+        total = d.get("total_bytes") or d.get("total_bytes_estimate")
+        if d.get("status") == "downloading" and total:
+            job["progress"] = d["downloaded_bytes"] / total
+
+    opts = {
+        **YDL_BASE,
+        "format": "bestaudio/best",
+        "outtmpl": str(dest / "source.%(ext)s"),
+        "ffmpeg_location": FFMPEG,
+        "progress_hooks": [hook],
+    }
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+    src = next(dest.glob("source.*"))
+    return src, info.get("title") or "제목 없음", info.get("webpage_url") or url
+
+
+def decode(path):
+    """어떤 포맷이든 44.1kHz 스테레오 float 배열로."""
+    cmd = [FFMPEG, "-v", "error", "-i", str(path), "-f", "f32le", "-ac", "2", "-ar", str(SR), "-"]
+    raw = subprocess.run(cmd, check=True, capture_output=True).stdout
+    return np.frombuffer(raw, dtype=np.float32).reshape(-1, 2)
+
+
+# ---------------------------------------------------------------- 분리
+def separate_ai(x, job, mode="ai"):
+    import torch
+    from demucs.apply import apply_model
+    from demucs.pretrained import get_model
+
+    if mode not in _models:
+        job["step"] = "AI 모델 준비 중 (처음 한 번만 다운로드)"
+        _models[mode] = get_model(MODELS[mode])
+        _models[mode].eval()
+    _model = _models[mode]
+    device = "cuda" if torch.cuda.is_available() else (
+        "mps" if torch.backends.mps.is_available() else "cpu")
+    job["step"] = "AI가 악기를 나누는 중"
+    job["progress"] = 0.0
+    wav = torch.from_numpy(x.T.copy())
+    ref = wav.mean(0)
+    mean, std = ref.mean(), ref.std() + 1e-8
+    total = wav.shape[-1]
+
+    def cb(d):
+        if d.get("state") == "end":
+            # get_model gives a BagOfModels; the segment length lives on the models inside it.
+            seg = int(float(getattr(_model, "segment", None) or _model.models[0].segment) * SR)
+            job["progress"] = min(0.99, (d["segment_offset"] + seg) / total)
+
+    with torch.no_grad():
+        out = apply_model(_model, ((wav - mean) / std)[None], device=device,
+                          split=True, overlap=0.25, callback=cb)[0]
+    out = (out * std + mean).cpu().numpy()
+    return {name: out[i].T for i, name in enumerate(_model.sources)}
+
+
+def _band(x, lo, hi):
+    if lo and hi:
+        sos = butter(6, [lo, hi], btype="bandpass", fs=SR, output="sos")
+    elif lo:
+        sos = butter(6, lo, btype="highpass", fs=SR, output="sos")
+    else:
+        sos = butter(6, hi, btype="lowpass", fs=SR, output="sos")
+    return sosfiltfilt(sos, x, axis=0)
+
+
+def separate_eq(x, job):
+    """빠른 모드: 주파수 대역만으로 자름. 몇 초면 끝나지만 소리가 섞임."""
+    job["step"] = "주파수 대역으로 나누는 중"
+    mid = x.mean(axis=1, keepdims=True).repeat(2, axis=1)
+    return {
+        "vocals": _band(mid, 300, 3400),
+        "bass": _band(x, 40, 250),
+        "drums": _band(x, None, 100) + _band(x, 5000, None),
+        "other": _band(x, 250, 6000),
+    }
+
+
+# ---------------------------------------------------------------- 작업 실행
+def run_job(job_id, mode, text=None, upload_path=None, title=None):
+    job = jobs[job_id]
+    try:
+        with work_lock:
+            source, matched, link = "file", None, None
+            if text:
+                job["step"] = "링크 확인 중"
+                url, title, key, source = resolve(text, job)
+            else:
+                key = hashlib.sha1(upload_path.read_bytes()).hexdigest()[:11]
+            song_id = f"{key}-{mode}"
+            folder = LIBRARY / song_id
+            if (folder / "meta.json").exists():  # 이미 분리한 곡이면 바로 열기
+                if upload_path:
+                    upload_path.unlink(missing_ok=True)
+                (folder / "meta.json").touch()
+                job.update(status="done", song_id=song_id, progress=1.0)
+                return
+            folder.mkdir(parents=True, exist_ok=True)
+            if text:
+                job.update(step="오디오 받는 중", progress=0.0)
+                src, matched, link = download(url, folder, job)
+                title = title or matched
+                if source == "youtube" or source == "search":
+                    matched = None  # 받은 영상 제목이 곧 곡 제목
+            else:
+                src = folder / ("source" + upload_path.suffix)
+                shutil.move(upload_path, src)
+            job.update(step="오디오 읽는 중", progress=0.0)
+            x = decode(src)
+            stems = separate_ai(x, job, mode) if mode in MODELS else separate_eq(x, job)
+            names = STEMS_6 if mode == "ai6" else STEMS
+            job.update(step="저장 중", progress=0.99)
+            peak = max(float(np.abs(s).max()) for s in stems.values())
+            scale = 0.99 / peak if peak > 0.99 else 1.0
+            for name in names:
+                sf.write(folder / f"{name}.wav", stems[name] * scale, SR, subtype="PCM_16")
+            src.unlink(missing_ok=True)
+            meta = {"id": song_id, "title": title, "mode": mode, "duration": len(x) / SR,
+                    "stems": names, "source": source, "matched": matched, "link": link,
+                    "input": text}
+            (folder / "meta.json").write_text(json.dumps(meta, ensure_ascii=False))
+            job.update(status="done", song_id=song_id, progress=1.0)
+    except Exception as e:
+        traceback.print_exc()
+        msg = str(e).replace("ERROR: ", "").split("\n")[0]
+        low = msg.lower()
+        if isinstance(e, UserError):
+            pass
+        elif "drm" in low:
+            msg = "DRM으로 보호된 음원이라 받을 수 없어요."
+        elif "sign in" in low or "private" in low or "members-only" in low:
+            msg = "이 영상은 로그인이 필요하거나 비공개라 받을 수 없어요."
+        elif "unsupported url" in low or "not a valid url" in low or "incomplete youtube id" in low:
+            msg = "지원하지 않는 링크예요. 유튜브·스포티파이·애플뮤직·사운드클라우드 링크나 곡 제목을 넣어 주세요."
+        elif "unable to connect" in low or "unable to download" in low or "timed out" in low:
+            msg = "인터넷에 연결하지 못했어요. 연결을 확인하고 다시 시도해 주세요."
+        elif "unavailable" in low:
+            msg = "볼 수 없는 영상이에요 (삭제됐거나 지역 제한)."
+        elif "ffmpeg" in low or "invalid data" in low:
+            msg = "오디오 파일을 읽지 못했어요. 다른 형식(mp3, wav)으로 시도해 주세요."
+        job.update(status="error", error=msg)
+        if "folder" in locals() and not (folder / "meta.json").exists():
+            shutil.rmtree(folder, ignore_errors=True)
+
+
+# ---------------------------------------------------------------- API
+@app.post("/api/jobs")
+async def create_job(mode: str = Form("ai"), url: str = Form(None), path: str = Form(None),
+                     file: UploadFile = File(None)):
+    if mode not in ("ai", "ai6", "eq"):
+        raise HTTPException(400, "mode")
+    job_id = uuid.uuid4().hex
+    jobs[job_id] = {"status": "running", "step": "대기 중", "progress": 0.0}
+    if url and url.strip():
+        args = dict(text=url.strip())
+    elif path:  # 같은 컴퓨터의 앱이 보내는 파일 경로
+        p = Path(path).expanduser()
+        if not p.is_file():
+            raise HTTPException(400, "파일을 찾지 못했어요")
+        tmp = LIBRARY / f"_upload_{job_id}{p.suffix.lower()}"
+        shutil.copyfile(p, tmp)
+        args = dict(upload_path=tmp, title=p.stem)
+    elif file is not None:
+        tmp = LIBRARY / f"_upload_{job_id}{Path(file.filename).suffix.lower()}"
+        tmp.write_bytes(await file.read())
+        args = dict(upload_path=tmp, title=Path(file.filename).stem)
+    else:
+        raise HTTPException(400, "링크나 파일을 넣어 주세요")
+    threading.Thread(target=run_job, args=(job_id, mode), kwargs=args, daemon=True).start()
+    return {"job_id": job_id}
+
+
+@app.get("/api/jobs/{job_id}")
+def job_status(job_id: str):
+    if job_id not in jobs:
+        raise HTTPException(404)
+    return jobs[job_id]
+
+
+@app.get("/api/songs")
+def list_songs():
+    metas = [json.loads(p.read_text()) for p in LIBRARY.glob("*/meta.json")]
+    metas.sort(key=lambda m: (LIBRARY / m["id"]).stat().st_mtime, reverse=True)
+    return metas
+
+
+@app.get("/api/songs/{song_id}")
+def song_meta(song_id: str):
+    p = LIBRARY / song_id / "meta.json"
+    if not p.exists():
+        raise HTTPException(404)
+    return json.loads(p.read_text())
+
+
+@app.delete("/api/songs/{song_id}")
+def delete_song(song_id: str):
+    folder = (LIBRARY / song_id).resolve()
+    if folder.parent != LIBRARY.resolve() or not folder.exists():
+        raise HTTPException(404)
+    shutil.rmtree(folder)
+    return {"ok": True}
+
+
+@app.get("/api/songs/{song_id}/{stem}.wav")
+def stem_file(song_id: str, stem: str):
+    p = (LIBRARY / song_id / f"{stem}.wav").resolve()
+    if stem not in STEMS_6 or p.parent.parent != LIBRARY.resolve() or not p.exists():
+        raise HTTPException(404)
+    return FileResponse(p, media_type="audio/wav")
+
+
+app.mount("/", StaticFiles(directory=ROOT / "static", html=True), name="static")
+
+if __name__ == "__main__":
+    import argparse
+    import uvicorn
+
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--port", type=int, default=8000)
+    ap.add_argument("--no-browser", action="store_true")
+    a = ap.parse_args()
+    if not a.no_browser:
+        threading.Timer(1.5, lambda: webbrowser.open(f"http://localhost:{a.port}")).start()
+    uvicorn.run(app, host="127.0.0.1", port=a.port, log_level="warning")

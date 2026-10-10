@@ -1,0 +1,18 @@
+# 분리된 곡과 음원 (저작권이 있는 음원이라 올리지 않음)
+library/
+stems/
+*.wav
+*.mp3
+*.m4a
+*.flac
+*.ogg
+*.webm
+*.opus
+
+# 설치·빌드 결과물
+.venv/
+__pycache__/
+mac/build/
+mac/.build/
+*.log
+.DS_Store
