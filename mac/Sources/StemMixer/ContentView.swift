@@ -22,7 +22,18 @@ struct ContentView: View {
             guard let provider = providers.first else { return false }
             _ = provider.loadObject(ofClass: URL.self) { url, _ in
                 guard let url else { return }
-                Task { @MainActor in model.submit(file: url) }
+                Task { @MainActor in
+                    // MIDI · UST files are notes, not songs to separate.
+                    if AppModel.isNoteFile(url) {
+                        if let editor = model.editor {
+                            model.importNotesFile(url, stem: editor.stem)
+                        } else {
+                            model.show("MIDI · UST 파일은 넣을 트랙 위에 놓아 주세요", success: false)
+                        }
+                    } else {
+                        model.submit(file: url)
+                    }
+                }
             }
             return true
         }

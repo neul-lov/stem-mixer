@@ -125,6 +125,7 @@ final class NoteEditor: ObservableObject, Identifiable {
         guard let next = redoStack.popLast() else { return }
         undoStack.append(notes)
         notes = next
+        selection = selection.intersection(Set(notes.map(\.id)))
         dirty = true
     }
 
@@ -315,7 +316,7 @@ final class NoteCanvasView: NSView {
     private enum Drag {
         case none
         case scrub
-        case move(anchor: Int, origin: [Int: EditNote], start: NSPoint, lastPitch: Int)
+        case move(anchor: Int, origin: [Int: EditNote], start: NSPoint, lastPitch: Int, copy: Bool)
         case resize(anchor: Int, origin: [Int: EditNote], start: NSPoint)
         case band(start: NSPoint, current: NSPoint, base: Set<Int>)
     }
@@ -590,7 +591,7 @@ final class NoteCanvasView: NSView {
             return
         }
         if hitNote == nil, e.tool == .draw {
-            addNote(at: p)
+            addNote(at: p, undoable: false)  // mouseUp records the add + length as one undo step
             if let id = e.selection.first, let n = e.notes.first(where: { $0.id == id }) {
                 drag = .resize(anchor: id, origin: [id: n], start: p)
             }
@@ -601,7 +602,7 @@ final class NoteCanvasView: NSView {
             drag = .band(start: p, current: p, base: flags.contains(.shift) ? e.selection : [])
             return
         }
-        var anchor = n.id
+        let anchor = n.id
         if flags.contains(.shift) || flags.contains(.command) {
             if e.selection.contains(n.id) {
                 e.selection.remove(n.id)
@@ -612,24 +613,18 @@ final class NoteCanvasView: NSView {
         } else if !e.selection.contains(n.id) {
             e.selection = [n.id]
         }
-        if flags.contains(.option), !edge {  // ⌥-drag copies
-            let copies = e.selected.map { e.newNote(start: $0.start, end: $0.end, pitch: $0.pitch, velocity: $0.velocity) }
-            let idx = e.selected.firstIndex { $0.id == n.id } ?? 0
-            e.notes += copies
-            e.selection = Set(copies.map(\.id))
-            anchor = copies[idx].id
-        }
         let origin = Dictionary(uniqueKeysWithValues: e.selected.map { ($0.id, $0) })
         drag = edge ? .resize(anchor: anchor, origin: origin, start: p)
-                    : .move(anchor: anchor, origin: origin, start: p, lastPitch: n.pitch)
+                    : .move(anchor: anchor, origin: origin, start: p, lastPitch: n.pitch,
+                            copy: flags.contains(.option))  // ⌥-drag copies (once the mouse moves)
         e.preview.play(n.pitch)
     }
 
-    private func addNote(at p: NSPoint) {
+    private func addNote(at p: NSPoint, undoable: Bool = true) {
         guard let e = editor else { return }
         let start = max(0, e.snapDown(time(p.x)))
         let note = e.newNote(start: start, end: start + e.newLength, pitch: max(0, min(127, pitch(p.y))))
-        e.checkpoint()
+        if undoable { e.checkpoint() }
         e.notes.append(note)
         e.selection = [note.id]
         e.preview.play(note.pitch)
@@ -645,7 +640,21 @@ final class NoteCanvasView: NSView {
             break
         case .scrub:
             model?.seek(max(0, time(max(p.x, keyW))))
-        case let .move(anchor, origin, start, lastPitch):
+        case .move(let anchor0, var origin, let start, let lastPitch, let copy):
+            var anchor = anchor0
+            if copy {
+                guard abs(p.x - start.x) > 2 || abs(p.y - start.y) > 2 else { return }
+                var copies: [Int: EditNote] = [:]
+                for o in origin.values {
+                    let c = e.newNote(start: o.start, end: o.end, pitch: o.pitch, velocity: o.velocity)
+                    copies[c.id] = c
+                    if o.id == anchor0 { anchor = c.id }
+                }
+                e.notes += copies.values.sorted { $0.start < $1.start }
+                e.selection = Set(copies.keys)
+                origin = copies
+                drag = .move(anchor: anchor, origin: origin, start: start, lastPitch: lastPitch, copy: false)
+            }
             guard let a = origin[anchor] else { return }
             var dt = snap(a.start + (time(p.x) - time(start.x))) - a.start
             dt = max(dt, -(origin.values.map(\.start).min() ?? 0))
@@ -661,7 +670,7 @@ final class NoteCanvasView: NSView {
             }
             if a.pitch + dp != lastPitch {
                 e.preview.play(a.pitch + dp)
-                drag = .move(anchor: anchor, origin: origin, start: start, lastPitch: a.pitch + dp)
+                drag = .move(anchor: anchor, origin: origin, start: start, lastPitch: a.pitch + dp, copy: false)
             }
         case let .resize(anchor, origin, start):
             guard let a = origin[anchor] else { return }

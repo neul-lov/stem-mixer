@@ -5,6 +5,7 @@
 - 다시 연주는 내장 신스(피아노풍 · 신스 리드 · 사인 · 스트링)로 해서 사운드폰트가 필요 없다.
 """
 import json
+import math
 import tempfile
 from pathlib import Path
 
@@ -281,7 +282,10 @@ def clean_input(notes):
     """편집기 · 파일에서 온 음표를 (시작초, 끝초, MIDI 음, 세기) 목록으로 정리."""
     out = []
     for n in notes:
-        s, e, p, v = float(n[0]), float(n[1]), int(round(float(n[2]))), float(n[3]) if len(n) > 3 else 0.8
+        s, e, v = float(n[0]), float(n[1]), float(n[3]) if len(n) > 3 else 0.8
+        if not all(map(math.isfinite, (s, e, v, float(n[2])))):  # Infinity · NaN은 버린다
+            continue
+        p = int(round(float(n[2])))
         if e - s >= 0.01 and 0 <= p <= 127 and e > 0:
             out.append((round(max(0.0, s), 4), round(e, 4), p, float(np.clip(v, 0.05, 1.0))))
     return sorted(out)

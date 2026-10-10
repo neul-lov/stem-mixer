@@ -248,9 +248,15 @@ final class AppModel: ObservableObject {
         Task {
             do {
                 let id = try await start()
+                var misses = 0
                 while true {
                     try await Task.sleep(for: .milliseconds(600))
-                    guard let status = try? await backend.job(id) else { continue }
+                    guard let status = try? await backend.job(id) else {
+                        misses += 1
+                        if misses >= 20 { throw engineStopped() }
+                        continue
+                    }
+                    misses = 0
                     if status.status == "error" { throw BackendError(message: status.error ?? "알 수 없는 오류") }
                     job?.step = status.step ?? ""
                     job?.progress = status.progress ?? 0
@@ -270,6 +276,13 @@ final class AppModel: ObservableObject {
                 }
             }
         }
+    }
+
+    /// The server stopped answering in the middle of a job (killed, e.g. out of memory). Without this the
+    /// job card would spin forever and nothing new could start. Starts it again and explains.
+    private func engineStopped() -> BackendError {
+        if !backend.isRunning, backend.isInstalled { try? backend.launch() }
+        return BackendError(message: "분리 엔진이 멈췄어요 (메모리가 모자라면 그럴 수 있어요). 엔진을 다시 켰으니 한 번 더 시도해 주세요.")
     }
 
     // MARK: Library
@@ -315,6 +328,7 @@ final class AppModel: ObservableObject {
         alert.buttons.first?.hasDestructiveAction = true
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         if song?.id == item.id {
+            if editor != nil { finishEditing() }
             mixer.unload()
             song = nil
             playing = false
@@ -363,6 +377,7 @@ final class AppModel: ObservableObject {
         alert.buttons.first?.hasDestructiveAction = true
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         if let id = song?.id, ids.contains(id) {
+            if editor != nil { finishEditing() }
             mixer.unload()
             song = nil
             playing = false
@@ -720,9 +735,15 @@ final class AppModel: ObservableObject {
         Task {
             do {
                 let jobID = try await backend.transcribe(id, stem: stem, sound: sound, snap: false)
+                var misses = 0
                 while true {
                     try await Task.sleep(for: .milliseconds(500))
-                    guard let status = try? await backend.job(jobID) else { continue }
+                    guard let status = try? await backend.job(jobID) else {
+                        misses += 1
+                        if misses >= 20 { throw engineStopped() }
+                        continue
+                    }
+                    misses = 0
                     if status.status == "error" { throw BackendError(message: status.error ?? "알 수 없는 오류") }
                     job?.step = status.step ?? ""
                     job?.progress = status.progress ?? 0

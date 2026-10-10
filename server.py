@@ -21,7 +21,7 @@ import imageio_ffmpeg
 import numpy as np
 import soundfile as sf
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from scipy.signal import butter, sosfiltfilt
 
@@ -35,8 +35,14 @@ FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()  # ffmpeg 따로 설치할 필요 없�
 # 같이 받은 ffmpeg를 .bin/ffmpeg로 연결해서 PATH 앞에 넣는다.
 _BIN = ROOT / ".bin"
 _BIN.mkdir(exist_ok=True)
-if not (_BIN / "ffmpeg").exists():
-    (_BIN / "ffmpeg").symlink_to(FFMPEG)
+_FF = _BIN / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
+if _FF.is_symlink() and not _FF.exists():  # 가리키던 ffmpeg가 업데이트로 바뀌어 끊긴 링크
+    _FF.unlink()
+if not _FF.exists():
+    try:
+        _FF.symlink_to(FFMPEG)
+    except OSError:  # Windows는 관리자 권한 없이는 링크를 못 만들어서 복사
+        shutil.copyfile(FFMPEG, _FF)
 os.environ["PATH"] = f"{_BIN}{os.pathsep}{os.environ.get('PATH', '')}"
 SR = 44100
 STEMS = ["vocals", "bass", "drums", "other"]
@@ -45,6 +51,23 @@ MODELS = {"ai": "htdemucs", "ai6": "htdemucs_6s"}  # 빠른 AI (Demucs만)
 MODES = ("hq", "hq6", "ai", "ai6", "eq")  # hq/hq6 = 최고 품질 (RoFormer 보컬 + Demucs)
 
 app = FastAPI()
+LOCAL_HOSTS = {"127.0.0.1", "localhost", "[::1]"}
+
+
+@app.middleware("http")
+async def only_this_computer(request, call_next):
+    """다른 웹사이트가 이 서버를 몰래 쓰지 못하게 막는다.
+    - 주소(Host)가 이 컴퓨터가 아니면 거절: DNS rebinding으로 곡 목록을 읽거나 곡을 지우는 것 막기.
+    - 브라우저가 보낸 요청(Origin)은 이 서버 화면에서 보낸 것만: 다른 사이트의 몰래 보내는 폼(CSRF) 막기.
+    Mac 앱의 요청에는 Origin이 없어서 그대로 된다."""
+    host = request.headers.get("host", "")
+    name = host if host.endswith("]") else host.rsplit(":", 1)[0]
+    origin = request.headers.get("origin")
+    if name not in LOCAL_HOSTS or (origin is not None and origin != f"http://{host}"):
+        return JSONResponse({"detail": "이 컴퓨터의 StemMixer에서 보낸 요청만 받아요"}, status_code=403)
+    return await call_next(request)
+
+
 jobs = {}  # job_id -> {"status", "step", "progress", "song_id", "error"}
 work_lock = threading.Lock()  # 분리는 한 번에 한 곡씩 (메모리 보호)
 _models = {}  # 모드 -> 불러온 Demucs 모델
@@ -379,6 +402,13 @@ def separate_eq(x, job):
 
 
 # ---------------------------------------------------------------- 작업 실행
+def save_meta(folder, meta):
+    """meta.json을 한 번에 바꾼다 (쓰는 도중에 다른 요청이 읽어도 반쯤 쓴 파일을 보지 않게)."""
+    tmp = folder / f".meta-{uuid.uuid4().hex}.tmp"
+    tmp.write_text(json.dumps(meta, ensure_ascii=False))
+    os.replace(tmp, folder / "meta.json")
+
+
 def kept_source(key):
     return next(iter(sorted(SOURCES.glob(f"{key}.*"))), None)
 
@@ -455,11 +485,15 @@ def run_job(job_id, mode, text=None, upload_path=None, title=None, resplit=None)
             meta = {"id": song_id, "title": title, "mode": mode, "duration": len(x) / SR,
                     "stems": names, "source": source, "matched": matched, "link": link,
                     "input": text}
-            if redo:  # 내 녹음 · MIDI 트랙은 그대로 둔다
+            if redo:  # 내 녹음 · MIDI 트랙은 그대로 둔다 (나누는 동안 새로 만든 것까지: 지금 meta에서)
+                try:
+                    old = json.loads((folder / "meta.json").read_text())
+                except (OSError, ValueError):
+                    pass
                 for k in ("replaced", "extras"):
                     if old.get(k):
                         meta[k] = old[k]
-            (folder / "meta.json").write_text(json.dumps(meta, ensure_ascii=False))
+            save_meta(folder, meta)
             job.update(status="done", song_id=song_id, progress=1.0)
     except Exception as e:
         traceback.print_exc()
@@ -542,11 +576,15 @@ def job_status(job_id: str):
 def list_songs():
     metas = []
     for p in LIBRARY.glob("*/meta.json"):
-        m = json.loads(p.read_text())
-        m["size"] = folder_size(p.parent)
-        m["created"] = p.stat().st_mtime
+        try:
+            m = json.loads(p.read_text())
+            m["size"] = folder_size(p.parent)
+            m["created"] = p.stat().st_mtime
+        except (OSError, ValueError):  # 망가진 곡 하나 때문에 목록 전체가 안 뜨지 않게
+            traceback.print_exc()
+            continue
         metas.append(m)
-    metas.sort(key=lambda m: (LIBRARY / m["id"]).stat().st_mtime, reverse=True)
+    metas.sort(key=lambda m: m["created"], reverse=True)
     return metas
 
 
@@ -624,9 +662,7 @@ def song_meta(song_id: str):
 
 @app.delete("/api/songs/{song_id}")
 def delete_song(song_id: str):
-    folder = (LIBRARY / song_id).resolve()
-    if folder.parent != LIBRARY.resolve() or not folder.exists():
-        raise HTTPException(404)
+    folder = song_folder(song_id)  # 곡 폴더만 (meta.json이 있는 곳). _sources 같은 폴더는 안 됨
     shutil.rmtree(folder)
     key = song_id.rsplit("-", 1)[0]
     if not any(LIBRARY.glob(f"{key}-*/meta.json")):  # 이 곡의 다른 버전이 없으면 원본도 지움
@@ -674,12 +710,13 @@ def run_transcribe(job_id, song_id, stem, sound, snap):
                 {"raw": raw, "key": [tonic, mode], "tempo": tempo}))
             job.update(step="깔끔한 소리로 다시 연주하는 중", progress=0.92)
             count = tr.render(folder, stem, sound, 0, snap)
+            meta = json.loads((folder / "meta.json").read_text())  # 읽는 동안 바뀐 것(녹음 · 다른 음표)을 지우지 않게
             extras = [x for x in meta.get("extras") or [] if x["id"] != f"{stem}_midi"]
             extras.append({"id": f"{stem}_midi", "source": stem, "label": f"{MIDI_LABEL.get(stem, stem)} (MIDI)",
                            "sound": sound, "snap": snap, "transpose": 0, "notes": count,
                            "key": tr.key_name(tonic, mode), "tempo": round(tempo)})
             meta["extras"] = extras
-            (folder / "meta.json").write_text(json.dumps(meta, ensure_ascii=False))
+            save_meta(folder, meta)
             job.update(status="done", song_id=song_id, progress=1.0)
     except Exception as e:
         traceback.print_exc()
@@ -719,7 +756,7 @@ def rerender_midi(song_id: str, stem: str, sound: str = Form(None), transpose: i
     if tempo:
         extra["tempo"] = round(max(30.0, min(300.0, tempo)), 1)
     extra["notes"] = tr.render(folder, stem, extra["sound"], extra["transpose"], extra["snap"], extra.get("tempo"))
-    (folder / "meta.json").write_text(json.dumps(meta, ensure_ascii=False))
+    save_meta(folder, meta)
     return meta
 
 
@@ -809,7 +846,7 @@ def song_tempo(song_id: str):
     if not meta.get("tempo"):
         mix = sum(sf.read(folder / f"{n}.wav", dtype="float32", always_2d=True)[0] for n in meta["stems"])
         meta["tempo"] = round(tr.detect_tempo(mix), 2)
-        (folder / "meta.json").write_text(json.dumps(meta, ensure_ascii=False))
+        save_meta(folder, meta)
     return {"tempo": meta["tempo"]}
 
 
@@ -855,7 +892,7 @@ def save_notes(song_id: str, stem: str, notes: str = Form(...), tempo: float = F
     extra.update(transpose=0, snap=False, edited=True, key=tr.key_name(tonic, mode), tempo=round(data["tempo"], 1))
     extra["notes"] = tr.render(folder, stem, extra["sound"], 0, False)
     meta["extras"] = extras
-    (folder / "meta.json").write_text(json.dumps(meta, ensure_ascii=False))
+    save_meta(folder, meta)
     return meta
 
 
@@ -877,7 +914,7 @@ def reset_notes(song_id: str, stem: str):
     p.write_text(json.dumps(data))
     extra.update(transpose=0, snap=False, edited=False, key=tr.key_name(tonic, mode))
     extra["notes"] = tr.render(folder, stem, extra["sound"], 0, False)
-    (folder / "meta.json").write_text(json.dumps(meta, ensure_ascii=False))
+    save_meta(folder, meta)
     return meta
 
 
@@ -885,10 +922,12 @@ def reset_notes(song_id: str, stem: str):
 def delete_midi(song_id: str, stem: str):
     folder = song_folder(song_id)
     meta = json.loads((folder / "meta.json").read_text())
+    if stem not in meta["stems"]:  # "*" 같은 이름으로 다른 파일까지 지우지 않게
+        raise HTTPException(400, "그 트랙이 없어요")
     meta["extras"] = [x for x in meta.get("extras") or [] if x["source"] != stem]
     for f in [folder / f"{stem}_midi.wav", *(folder / "midi").glob(f"{stem}.*")] if (folder / "midi").exists() else []:
         Path(f).unlink(missing_ok=True)
-    (folder / "meta.json").write_text(json.dumps(meta, ensure_ascii=False))
+    save_meta(folder, meta)
     return meta
 
 
@@ -946,7 +985,7 @@ def set_user_track(song_id: str, stem: str = Form(...), path: str = Form(None), 
         raise HTTPException(400, "오디오 파일을 읽지 못했어요. wav, mp3, m4a, aiff 파일을 넣어 주세요.")
     replaced[stem] = cur
     meta["replaced"] = replaced
-    (folder / "meta.json").write_text(json.dumps(meta, ensure_ascii=False))
+    save_meta(folder, meta)
     return meta
 
 
@@ -954,10 +993,12 @@ def set_user_track(song_id: str, stem: str = Form(...), path: str = Form(None), 
 def remove_user_track(song_id: str, stem: str):
     folder = song_folder(song_id)
     meta = json.loads((folder / "meta.json").read_text())
+    if stem not in meta["stems"]:
+        raise HTTPException(400, "그 트랙이 없어요")
     (meta.get("replaced") or {}).pop(stem, None)
     for f in (folder / "user").glob(f"{stem}.*") if (folder / "user").exists() else []:
         f.unlink()
-    (folder / "meta.json").write_text(json.dumps(meta, ensure_ascii=False))
+    save_meta(folder, meta)
     return meta
 
 
