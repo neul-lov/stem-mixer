@@ -273,3 +273,109 @@ def render(folder, stem, sound, transpose, snap, tempo=None):
     data["notes"] = notes
     (folder / "midi" / f"{stem}.json").write_text(json.dumps(data))
     return len(notes)
+
+
+# ---------------------------------------------------------------- OpenUtau / UTAU로 내보내기
+TICKS = 480  # OpenUtau and UTAU both use 480 ticks per quarter note
+
+
+def clean_notes(notes, tempo, quantize=False):
+    """한 음씩 부르는 파트로 정리: 겹치는 음 자르기, 아주 짧은 음 합치기, (선택) 16분음표 격자에 맞추기."""
+    notes = sorted(notes)
+    out = []
+    for s, e, p, v in notes:
+        if out and s < out[-1][1]:  # overlap: end the previous note here
+            out[-1][1] = s
+        if out and out[-1][1] - out[-1][0] < 0.06:
+            out.pop()
+        out.append([s, e, p, v])
+    out = [n for n in out if n[1] - n[0] >= 0.06]
+    if quantize:
+        step = 60 / tempo / 4
+        q = []
+        for s, e, p, v in out:
+            s2, e2 = round(s / step) * step, round(e / step) * step
+            if e2 <= s2:
+                e2 = s2 + step
+            if q and s2 < q[-1][1]:
+                s2 = q[-1][1]
+            if e2 > s2:
+                q.append([s2, e2, p, v])
+        out = q
+    return [tuple(n) for n in out]
+
+
+def to_ticks(sec, tempo):
+    return int(round(sec * tempo / 60 * TICKS))
+
+
+def write_ustx(path, notes, tempo, name, waves, lyric="ら"):
+    """OpenUtau 프로젝트 (ustx 0.6 형식; OpenUtau가 열 때 최신 형식으로 올려 준다).
+    waves = [(트랙 이름, 파일 이름, 길이 ms, 음소거 여부)] — 반주 · 원래 보컬을 같이 넣어서 맞춰 가며 조율."""
+    import yaml
+
+    vnotes = []
+    for s, e, p, v in notes:
+        a, b = to_ticks(s, tempo), to_ticks(e, tempo)
+        if b <= a:
+            continue
+        vnotes.append({
+            "position": a, "duration": b - a, "tone": int(p), "lyric": lyric,
+            "pitch": {"data": [{"x": -25, "y": 0, "shape": "io"}, {"x": 25, "y": 0, "shape": "io"}], "snap_first": True},
+            "vibrato": {"length": 0, "period": 175, "depth": 25, "in": 10, "out": 10, "shift": 0, "drift": 0, "vol_link": 0},
+            "phoneme_expressions": [], "phoneme_overrides": [],
+        })
+    end = max((n["position"] + n["duration"] for n in vnotes), default=TICKS * 4)
+    tracks = [{"singer": "", "phonemizer": "OpenUtau.Core.DefaultPhonemizer",
+               "renderer_settings": {"renderer": "CLASSIC", "resampler": "worldline"},
+               "track_name": name, "track_color": "Pink", "mute": False, "solo": False, "volume": 0, "pan": 0}]
+    wave_parts = []
+    for i, (track_name, file, ms, mute) in enumerate(waves, start=1):
+        tracks.append({"singer": None, "phonemizer": None, "track_name": track_name, "track_color": "Blue",
+                       "mute": mute, "solo": False, "volume": -6 if not mute else 0, "pan": 0})
+        wave_parts.append({"name": track_name, "comment": "", "track_no": i, "position": 0,
+                           "relative_path": file, "file_duration_ms": float(ms),
+                           "skip": 0, "trim": 0, "fadein": 0, "fadeout": 0})
+    project = {
+        "name": name, "comment": "StemMixer에서 내보냄. 1마디 첫 박 = 곡 시작 (0초)",
+        "output_dir": "Vocal", "cache_dir": "UCache", "ustx_version": "0.6",
+        "key": 0,
+        "time_signatures": [{"bar_position": 0, "beat_per_bar": 4, "beat_unit": 4}],
+        "tempos": [{"position": 0, "bpm": float(round(tempo, 3))}],
+        "tracks": tracks,
+        "voice_parts": [{"name": name, "comment": "", "track_no": 0, "position": 0,
+                         "duration": end + TICKS, "notes": vnotes, "curves": []}],
+        "wave_parts": wave_parts,
+    }
+    Path(path).write_text(yaml.safe_dump(project, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    return len(vnotes)
+
+
+def write_ust(path, notes, tempo, name, lyric="ら"):
+    """UTAU용 .ust (쉼표는 R 음표로 채운다). Shift-JIS로 저장 (UTAU 기본)."""
+    lines = ["[#VERSION]", "UST Version1.2", "[#SETTING]", f"Tempo={tempo:.2f}", "Tracks=1",
+             f"ProjectName={name}", "VoiceDir=%VOICE%", "OutFile=", "CacheDir=", "Tool1=wavtool.exe",
+             "Tool2=resampler.exe", "Mode2=True"]
+    cursor, idx = 0, 0
+
+    def note(length, lyric_, num):
+        nonlocal idx
+        lines.extend([f"[#{idx:04d}]", f"Length={length}", f"Lyric={lyric_}", f"NoteNum={num}",
+                      "PreUtterance=", "Intensity=100", "Modulation=0"])
+        idx += 1
+
+    for s, e, p, v in notes:
+        a, b = to_ticks(s, tempo), to_ticks(e, tempo)
+        if b <= a:
+            continue
+        if a > cursor:
+            note(a - cursor, "R", 60)
+        elif a < cursor:  # rounding overlap
+            a = cursor
+            if b <= a:
+                continue
+        note(b - a, lyric, int(p))
+        cursor = b
+    lines.append("[#TRACKEND]")
+    Path(path).write_bytes(("\r\n".join(lines) + "\r\n").encode("shift_jis", errors="replace"))
+    return idx

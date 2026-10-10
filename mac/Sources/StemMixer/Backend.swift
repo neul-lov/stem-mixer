@@ -168,6 +168,18 @@ final class Backend {
         return try JSONDecoder().decode(Song.self, from: try await post("api/songs/\(songID)/midi/\(stem)", items))
     }
 
+    /// Writes an OpenUtau (.ustx) / UTAU (.ust) project with the backing track into `dest`. Returns the folder.
+    func utauExport(_ songID: String, stem: String, dest: URL, quantize: Bool) async throws -> URL {
+        let data = try await post("api/songs/\(songID)/utau-export", [
+            URLQueryItem(name: "stem", value: stem), URLQueryItem(name: "dest", value: dest.path),
+            URLQueryItem(name: "quantize", value: quantize ? "1" : "0"),
+        ])
+        guard let folder = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["folder"] as? String else {
+            throw BackendError(message: "내보내지 못했어요")
+        }
+        return URL(fileURLWithPath: folder)
+    }
+
     func deleteMidi(_ songID: String, stem: String) async throws -> Song {
         var req = URLRequest(url: base_.appendingPathComponent("api/songs/\(songID)/midi/\(stem)"))
         req.httpMethod = "DELETE"

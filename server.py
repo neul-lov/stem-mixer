@@ -6,6 +6,7 @@
 """
 import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -30,6 +31,13 @@ LIBRARY.mkdir(exist_ok=True)
 SOURCES = LIBRARY / "_sources"  # 원본 오디오 (다른 방식으로 다시 분리할 때 다시 받지 않도록 보관)
 SOURCES.mkdir(exist_ok=True)
 FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()  # ffmpeg 따로 설치할 필요 없음
+# audio-separator는 PATH에서 "ffmpeg"를 찾는다. 앱(Finder)으로 켜면 PATH가 짧아서 못 찾으니
+# 같이 받은 ffmpeg를 .bin/ffmpeg로 연결해서 PATH 앞에 넣는다.
+_BIN = ROOT / ".bin"
+_BIN.mkdir(exist_ok=True)
+if not (_BIN / "ffmpeg").exists():
+    (_BIN / "ffmpeg").symlink_to(FFMPEG)
+os.environ["PATH"] = f"{_BIN}{os.pathsep}{os.environ.get('PATH', '')}"
 SR = 44100
 STEMS = ["vocals", "bass", "drums", "other"]
 STEMS_6 = ["vocals", "bass", "drums", "guitar", "piano", "other"]  # ai6 모드 (기타·피아노 추가)
@@ -574,6 +582,51 @@ def rerender_midi(song_id: str, stem: str, sound: str = Form(None), transpose: i
     extra["notes"] = tr.render(folder, stem, extra["sound"], extra["transpose"], extra["snap"], extra.get("tempo"))
     (folder / "meta.json").write_text(json.dumps(meta, ensure_ascii=False))
     return meta
+
+
+@app.post("/api/songs/{song_id}/utau-export")
+def utau_export(song_id: str, stem: str = Form("vocals"), dest: str = Form(...), quantize: int = Form(0)):
+    """뽑은 멜로디를 OpenUtau(.ustx) · UTAU(.ust) 프로젝트로. 반주(이 트랙만 뺀 소리)와 원래 트랙도 같이 넣어서
+    그 위에서 조율할 수 있게. 프로젝트 시작(0틱) = 곡 시작(0초)이라 렌더한 wav를 그대로 넣으면 맞는다."""
+    import transcribe as tr
+
+    folder = song_folder(song_id)
+    meta = json.loads((folder / "meta.json").read_text())
+    extra = next((x for x in meta.get("extras") or [] if x["source"] == stem), None)
+    if not extra:
+        raise HTTPException(400, "먼저 이 트랙의 음정을 뽑아 주세요")
+    data = json.loads((folder / "midi" / f"{stem}.json").read_text())
+    tempo = float(extra.get("tempo") or data["tempo"])
+    notes = tr.clean_notes(data.get("notes", data["raw"]), tempo, bool(quantize))
+    label = MIDI_LABEL.get(stem, stem)
+    safe = re.sub(r'[/:\\]', "-", meta["title"])[:80]
+    out = Path(dest).expanduser() / f"{safe} - {label} (OpenUtau)"
+    out.mkdir(parents=True, exist_ok=True)
+    replaced = meta.get("replaced") or {}
+
+    def active(n):
+        return folder / "user" / f"{n}.wav" if (replaced.get(n) or {}).get("use") else folder / f"{n}.wav"
+
+    rest = [n for n in meta["stems"] if n != stem]
+    backing = sum(sf.read(active(n), dtype="float32", always_2d=True)[0] for n in rest)
+    peak = float(np.abs(backing).max())
+    sf.write(out / "backing.wav", backing / peak * 0.95 if peak > 0.95 else backing, SR, subtype="PCM_16")
+    guide, _ = sf.read(active(stem), dtype="float32", always_2d=True)
+    sf.write(out / f"guide_{stem}.wav", guide, SR, subtype="PCM_16")
+    ms = len(backing) / SR * 1000
+    n = tr.write_ustx(out / "project.ustx", notes, tempo, f"{label}",
+                      [("반주 (이 파트 뺀 소리)", "backing.wav", ms, False), (f"원래 {label} (참고용)", f"guide_{stem}.wav", ms, True)])
+    tr.write_ust(out / "project.ust", notes, tempo, label)
+    shutil.copyfile(folder / "midi" / f"{stem}.mid", out / "melody.mid")
+    (out / "읽어 주세요.txt").write_text(
+        f"{meta['title']} · {label}\n\n"
+        f"- project.ustx: OpenUtau로 열기. 첫 트랙에 원하는 가수(예: 重音テト)를 고르고 가사를 넣어 조율하세요.\n"
+        f"  '반주' 트랙이 같이 들어 있어요. '원래 {label}' 트랙은 음소거돼 있으니 참고할 때 켜세요.\n"
+        f"- project.ust: UTAU용 (같은 음표). melody.mid: 다른 보컬 신스용.\n"
+        f"- 빠르기 {tempo:g} BPM, 1마디 첫 박 = 곡 시작(0초). 음표 {n}개, 기본 가사 'ら'.\n"
+        f"- 다 되면 OpenUtau에서 보컬 트랙을 wav로 내보내고(처음부터), StemMixer의 {label} 트랙에 끌어다 놓으세요.\n"
+        f"  0초부터 시작하는 wav면 싱크가 그대로 맞아요.\n", encoding="utf-8")
+    return {"folder": str(out), "notes": n, "tempo": tempo}
 
 
 @app.get("/api/songs/{song_id}/midi/{stem}.json")

@@ -363,6 +363,9 @@ struct TrackRow: View {
             if isMidi, let midi = model.song?.midi(for: name) {
                 Button("피아노 롤 보기") { model.openRoll(name) }
                 Button("MIDI 파일 복사") { model.copyMidi(midi.source) }
+                if midi.source == "vocals" || midi.source == "bass" {
+                    Button("OpenUtau · UTAU로 내보내기…") { model.exportUtau(midi.source, quantize: false) }
+                }
                 Button("음정 트랙 지우기", role: .destructive) { model.removeMidi(midi.source) }
             } else {
                 Button("내 파일로 바꾸기…") { model.chooseReplacement(for: name) }
@@ -656,6 +659,21 @@ struct MidiSettings: View {
                 Button("지우기", role: .destructive) { model.removeMidi(stem) }.font(.system(size: 12, weight: .semibold))
             }
             Button("피아노 롤 보기") { model.openRoll("\(stem)_midi") }.font(.system(size: 12, weight: .semibold))
+            if stem == "vocals" || stem == "bass" {
+                Divider()
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("보컬 신스로 다시 부르기").font(.system(size: 11, weight: .bold)).foregroundStyle(.secondary)
+                    HStack(spacing: 8) {
+                        Button("OpenUtau · UTAU로 내보내기…") { model.exportUtau(stem, quantize: false) }
+                        Button("박자 맞춰서") { model.exportUtau(stem, quantize: true) }
+                            .help("음표를 16분음표 격자에 맞춰서 내보내요 (빠르기가 맞을 때만 쓰세요)")
+                    }
+                    .font(.system(size: 12, weight: .semibold))
+                    Text("반주 트랙이 같이 들어가요. 조율해서 0초부터 wav로 내보낸 뒤 \(StemInfo.of(stem).label) 트랙에 끌어다 놓으면 싱크가 맞아요. 빠르기가 맞는지 먼저 확인하세요 (지금 \(Int(midi.tempo ?? 120)) BPM).")
+                        .font(.system(size: 10.5)).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
         }
         .padding(14)
         .frame(width: 330)

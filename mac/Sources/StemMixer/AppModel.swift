@@ -683,6 +683,31 @@ final class AppModel: ObservableObject {
         updateUserTrack(stem, "음정 트랙을 지웠어요") { try await self.backend.deleteMidi(song.id, stem: stem) }
     }
 
+    /// Exports the melody as an OpenUtau / UTAU project to tune with a vocal synth (e.g. Kasane Teto),
+    /// with the backing track inside, so the rendered vocal can be dropped back on the track at 0 s.
+    func exportUtau(_ stem: String, quantize: Bool) {
+        guard let song else { return }
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.prompt = "여기에 내보내기"
+        panel.message = "OpenUtau 프로젝트 폴더를 만들 곳을 고르세요"
+        panel.directoryURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+        guard panel.runModal() == .OK, let dest = panel.url else { return }
+        busyStem = "\(stem)_midi"
+        Task {
+            do {
+                let folder = try await backend.utauExport(song.id, stem: stem, dest: dest, quantize: quantize)
+                NSWorkspace.shared.activateFileViewerSelecting([folder.appendingPathComponent("project.ustx")])
+                show("OpenUtau 프로젝트를 만들었어요")
+            } catch {
+                show(error.localizedDescription, success: false)
+            }
+            busyStem = nil
+        }
+    }
+
     func openRoll(_ extraID: String) {
         guard let song, let extra = song.midi(for: extraID) else { return }
         Task {
