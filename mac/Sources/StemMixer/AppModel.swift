@@ -271,8 +271,17 @@ final class AppModel: ObservableObject {
                         withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) { job = nil }
                         input = ""
                         await refreshSongs()
-                        open(songID)
-                        show("분리 완료")
+                        if song == nil {
+                            open(songID)
+                            show("분리 완료")
+                        } else if song?.id == songID, editor == nil, let meta = songs.first(where: { $0.id == songID }) {
+                            reload(meta)  // the song you're on was split again: new tracks, same place, keeps playing
+                            show("분리 완료 · 새 트랙으로 바꿨어요")
+                        } else {
+                            // Don't stop what you're listening to or editing: the new song waits in the list.
+                            let title = songs.first(where: { $0.id == songID })?.title ?? "새 곡"
+                            show("분리 완료 · '\(title)'은 목록 맨 위에 있어요")
+                        }
                         return
                     }
                 }

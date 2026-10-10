@@ -67,6 +67,8 @@ final class Mixer {
         }
         tracks = [:]
         order = []
+        gains = [:]
+        ramps = [:]
         length = 0
         levelLock.withLock { levels = [:] }
     }
@@ -119,8 +121,46 @@ final class Mixer {
 
     var currentTime: Double { Double(currentFrame) / sampleRate }
 
+    // Gain changes glide instead of jumping: a stem coming back from silence (solo off, a preset) at full
+    // level in one step makes a loud click.
+    private var gains: [String: Double] = [:]
+    private var ramps: [String: (from: Double, to: Double, start: TimeInterval, length: Double)] = [:]
+    private var rampTimer: Timer?
+
     /// gain is linear: 1 = 100%, 2 = 200%.
     func setGain(_ gain: Double, for name: String) {
+        guard tracks[name] != nil else { return }
+        let now = gains[name] ?? gain
+        guard isPlaying, abs(now - gain) > 0.0005 else {
+            ramps[name] = nil
+            write(gain, for: name)
+            return
+        }
+        // Bigger changes take longer: about 0.2 s from silence to 100%, a few ms for a slider nudge.
+        let length = 0.03 + 0.17 * min(1, abs(gain - now))
+        ramps[name] = (now, gain, ProcessInfo.processInfo.systemUptime, length)
+        if rampTimer == nil {
+            let timer = Timer(timeInterval: 0.004, repeats: true) { [weak self] _ in self?.stepRamps() }
+            RunLoop.main.add(timer, forMode: .common)
+            rampTimer = timer
+        }
+    }
+
+    private func stepRamps() {
+        let now = ProcessInfo.processInfo.systemUptime
+        for (name, r) in ramps {
+            let p = min(1, (now - r.start) / r.length)
+            write(r.from + (r.to - r.from) * p, for: name)
+            if p >= 1 { ramps[name] = nil }
+        }
+        if ramps.isEmpty {
+            rampTimer?.invalidate()
+            rampTimer = nil
+        }
+    }
+
+    private func write(_ gain: Double, for name: String) {
+        gains[name] = gain
         guard let track = tracks[name] else { return }
         // -96 dB is silence; the EQ's gain also lets a stem go above 100%.
         track.eq.globalGain = gain < 0.005 ? -96 : Float(max(-96, min(24, 20 * log10(gain))))
