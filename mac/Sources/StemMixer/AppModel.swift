@@ -184,6 +184,22 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// The id of this song's version in another mode, if it has been made already.
+    func version(of item: Song, mode: SplitMode) -> Song? {
+        songs.first { $0.id == "\(item.key)-\(mode.rawValue)" }
+    }
+
+    func resplit(_ item: Song, mode: SplitMode) {
+        if let existing = version(of: item, mode: mode) {
+            open(existing.id)
+            return
+        }
+        guard server == .ready, job == nil else { return }
+        run(label: "\(item.title) → \(mode.title)") {
+            try await self.backend.resplit(item.id, mode: mode.rawValue)
+        }
+    }
+
     func chooseFile() {
         let panel = NSOpenPanel()
         panel.allowedContentTypes = [.audio, .movie]

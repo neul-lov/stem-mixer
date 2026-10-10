@@ -11,6 +11,9 @@ struct Song: Codable, Identifiable, Equatable {
     var link: String?
     var input: String?
 
+    /// The part of the id shared by every mode's version of this song.
+    var key: String { String(id[..<(id.lastIndex(of: "-") ?? id.endIndex)]) }
+
     var sourceInfo: (name: String, icon: String) {
         switch source {
         case "spotify": ("Spotify", "dot.radiowaves.left.and.right")
@@ -116,6 +119,20 @@ final class Backend {
         req.httpBody = form.percentEncodedQuery?
             .replacingOccurrences(of: "+", with: "%2B")
             .data(using: .utf8)
+        let (data, response) = try await URLSession.shared.data(for: req)
+        let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        guard (response as? HTTPURLResponse)?.statusCode == 200, let id = json?["job_id"] as? String else {
+            throw BackendError(message: json?["detail"] as? String ?? "요청이 실패했어요")
+        }
+        return id
+    }
+
+    /// Separates a song already in the library again with another mode. Returns the job id.
+    func resplit(_ songID: String, mode: String) async throws -> String {
+        var req = URLRequest(url: base.appendingPathComponent("api/songs/\(songID)/resplit"))
+        req.httpMethod = "POST"
+        req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        req.httpBody = "mode=\(mode)".data(using: .utf8)
         let (data, response) = try await URLSession.shared.data(for: req)
         let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
         guard (response as? HTTPURLResponse)?.statusCode == 200, let id = json?["job_id"] as? String else {

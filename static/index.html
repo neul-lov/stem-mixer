@@ -404,10 +404,29 @@ async function loadLibrary() {
   $("lib").innerHTML = "";
   for (const s of songs) {
     const el = document.createElement("div"); el.className = "lib-item";
-    el.innerHTML = `<span class="name"></span><span class="tag">${{ ai: "AI", ai6: "AI 6트랙", eq: "빠른 모드" }[s.mode] || s.mode} · ${fmt(s.duration)}</span><button>삭제</button>`;
+    el.innerHTML = `<span class="name"></span><span class="tag">${{ ai: "AI", ai6: "AI 6트랙", eq: "빠른 모드" }[s.mode] || s.mode} · ${fmt(s.duration)}</span><button class="del">삭제</button>`;
     el.querySelector(".name").textContent = s.title;
+    // 다른 방식으로 다시 분리 (이미 있으면 그 버전을 연다)
+    const key = s.id.slice(0, s.id.lastIndexOf("-"));
+    for (const [m, label] of [["ai", "4트랙"], ["ai6", "6트랙"], ["eq", "빠르게"]]) {
+      if (m === s.mode) continue;
+      const btn = document.createElement("button");
+      const exists = songs.some(o => o.id === `${key}-${m}`);
+      btn.textContent = exists ? `${label} 열기` : `→ ${label}`;
+      btn.title = exists ? `${label} 버전 열기` : `${label}으로 다시 분리`;
+      btn.onclick = () => {
+        if (exists) return openSong(`${key}-${m}`);
+        const fd = new FormData(); fd.append("mode", m);
+        showErr(""); setBusy(true);
+        $("progress").style.display = "block"; $("step").textContent = "보내는 중"; $("barFill").style.width = "0";
+        fetch(`/api/songs/${s.id}/resplit`, { method: "POST", body: fd })
+          .then(r => r.ok ? r.json() : r.json().then(j => { throw new Error(j.detail || "요청 실패"); }))
+          .then(({ job_id }) => poll(job_id)).catch(e => fail(e.message));
+      };
+      el.insertBefore(btn, el.querySelector(".del"));
+    }
     el.querySelector(".name").onclick = () => openSong(s.id);
-    el.querySelector("button").onclick = async () => {
+    el.querySelector(".del").onclick = async () => {
       if (!confirm(`'${s.title}'을(를) 목록에서 지울까요?`)) return;
       await fetch(`/api/songs/${s.id}`, { method: "DELETE" });
       if (song && song.id === s.id) { if (playing) pause(); song = null; $("player").style.display = "none"; }

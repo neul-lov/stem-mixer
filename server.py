@@ -27,6 +27,8 @@ from scipy.signal import butter, sosfiltfilt
 ROOT = Path(__file__).parent
 LIBRARY = ROOT / "library"  # 분리된 곡이 쌓이는 곳 (곡마다 폴더 하나)
 LIBRARY.mkdir(exist_ok=True)
+SOURCES = LIBRARY / "_sources"  # 원본 오디오 (다른 방식으로 다시 분리할 때 다시 받지 않도록 보관)
+SOURCES.mkdir(exist_ok=True)
 FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()  # ffmpeg 따로 설치할 필요 없음
 SR = 44100
 STEMS = ["vocals", "bass", "drums", "other"]
@@ -226,12 +228,29 @@ def separate_eq(x, job):
 
 
 # ---------------------------------------------------------------- 작업 실행
-def run_job(job_id, mode, text=None, upload_path=None, title=None):
+def kept_source(key):
+    return next(iter(sorted(SOURCES.glob(f"{key}.*"))), None)
+
+
+def mix_stems(folder, dest):
+    """원본이 없을 때: 이미 나눈 트랙을 다시 합쳐서 원곡을 만든다 (AI 트랙은 합치면 거의 원곡)."""
+    meta = json.loads((folder / "meta.json").read_text())
+    total = sum(sf.read(folder / f"{n}.wav", dtype="float32")[0] for n in meta["stems"])
+    sf.write(dest, np.clip(total, -1, 1), SR, subtype="PCM_16")
+    return dest
+
+
+def run_job(job_id, mode, text=None, upload_path=None, title=None, resplit=None):
     job = jobs[job_id]
     try:
         with work_lock:
             source, matched, link = "file", None, None
-            if text:
+            if resplit:  # 라이브러리에 있는 곡을 다른 방식으로 다시 분리
+                old = json.loads((LIBRARY / resplit / "meta.json").read_text())
+                key = resplit.rsplit("-", 1)[0]
+                title, source = old["title"], old.get("source") or "file"
+                matched, link, text = old.get("matched"), old.get("link"), old.get("input")
+            elif text:
                 job["step"] = "링크 확인 중"
                 url, title, key, source = resolve(text, job)
             else:
@@ -245,7 +264,17 @@ def run_job(job_id, mode, text=None, upload_path=None, title=None):
                 job.update(status="done", song_id=song_id, progress=1.0)
                 return
             folder.mkdir(parents=True, exist_ok=True)
-            if text:
+            kept = kept_source(key)
+            if resplit and kept:
+                src = folder / ("source" + kept.suffix)
+                shutil.copyfile(kept, src)
+            elif resplit and not (link or (text and source != "file")):
+                job.update(step="이미 나눈 트랙으로 원곡을 다시 만드는 중", progress=0.0)
+                src = mix_stems(LIBRARY / resplit, folder / "source.wav")
+            elif resplit:
+                job.update(step="원본 오디오 다시 받는 중", progress=0.0)
+                src, _, _ = download(link or text, folder, job)
+            elif text:
                 job.update(step="오디오 받는 중", progress=0.0)
                 src, matched, link = download(url, folder, job)
                 title = title or matched
@@ -263,6 +292,8 @@ def run_job(job_id, mode, text=None, upload_path=None, title=None):
             scale = 0.99 / peak if peak > 0.99 else 1.0
             for name in names:
                 sf.write(folder / f"{name}.wav", stems[name] * scale, SR, subtype="PCM_16")
+            if not kept_source(key):  # 다음에 다른 방식으로 나눌 때 쓰도록 원본 보관
+                shutil.move(src, SOURCES / f"{key}{src.suffix.lower()}")
             src.unlink(missing_ok=True)
             meta = {"id": song_id, "title": title, "mode": mode, "duration": len(x) / SR,
                     "stems": names, "source": source, "matched": matched, "link": link,
@@ -319,6 +350,16 @@ async def create_job(mode: str = Form("ai"), url: str = Form(None), path: str = 
     return {"job_id": job_id}
 
 
+@app.post("/api/songs/{song_id}/resplit")
+def resplit_song(song_id: str, mode: str = Form(...)):
+    if mode not in ("ai", "ai6", "eq") or not (LIBRARY / song_id / "meta.json").exists():
+        raise HTTPException(400, "다시 분리할 곡을 찾지 못했어요")
+    job_id = uuid.uuid4().hex
+    jobs[job_id] = {"status": "running", "step": "대기 중", "progress": 0.0}
+    threading.Thread(target=run_job, args=(job_id, mode), kwargs=dict(resplit=song_id), daemon=True).start()
+    return {"job_id": job_id}
+
+
 @app.get("/api/jobs/{job_id}")
 def job_status(job_id: str):
     if job_id not in jobs:
@@ -347,6 +388,10 @@ def delete_song(song_id: str):
     if folder.parent != LIBRARY.resolve() or not folder.exists():
         raise HTTPException(404)
     shutil.rmtree(folder)
+    key = song_id.rsplit("-", 1)[0]
+    if not any(LIBRARY.glob(f"{key}-*/meta.json")):  # 이 곡의 다른 버전이 없으면 원본도 지움
+        for f in SOURCES.glob(f"{key}.*"):
+            f.unlink()
     return {"ok": True}
 
 

@@ -65,6 +65,22 @@ struct PlayerView: View {
                 tag(song.sourceInfo.name, icon: song.sourceInfo.icon)
                 tag(SplitMode.label(song.mode), icon: SplitMode.icon(song.mode))
                 tag(formatTime(song.duration), icon: "clock")
+                Menu {
+                    ResplitItems(item: song, model: model)
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "arrow.triangle.2.circlepath")
+                        Text("다른 방식으로 분리")
+                    }
+                    .font(.system(size: 10.5, weight: .semibold))
+                    .foregroundStyle(Color.accentColor)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(Capsule().fill(Color.accentColor.opacity(0.12)))
+                }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .fixedSize()
             }
             if let matched = song.matched {
                 // Spotify / Apple Music audio can't be downloaded, so we play the closest YouTube match.

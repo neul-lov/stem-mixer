@@ -362,6 +362,47 @@ struct JobCard: View {
     }
 }
 
+/// "AI 6트랙으로 다시 분리" etc. — opens the version if it already exists.
+struct ResplitItems: View {
+    let item: Song
+    @ObservedObject var model: AppModel
+
+    var body: some View {
+        ForEach(SplitMode.allCases.filter { $0.rawValue != item.mode }) { mode in
+            Button(model.version(of: item, mode: mode) == nil ? "\(mode.title)으로 다시 분리" : "\(mode.title) 버전 열기") {
+                model.resplit(item, mode: mode)
+            }
+            .disabled(model.version(of: item, mode: mode) == nil && model.job != nil)
+        }
+    }
+}
+
+struct ResplitMenu: View {
+    let item: Song
+    @ObservedObject var model: AppModel
+    @State private var hovering = false
+
+    var body: some View {
+        Menu {
+            ResplitItems(item: item, model: model)
+        } label: {
+            Image(systemName: "arrow.triangle.2.circlepath")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(hovering ? Color.accentColor : .secondary)
+                .frame(width: 26, height: 26)
+                .background(
+                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        .fill(Color.primary.opacity(hovering ? 0.1 : 0))
+                )
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("다른 방식으로 분리")
+        .onHover { h in withAnimation(.easeOut(duration: 0.12)) { hovering = h } }
+    }
+}
+
 struct LibraryRow: View {
     let item: Song
     let current: Bool
@@ -383,6 +424,7 @@ struct LibraryRow: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             if hovering {
                 HStack(spacing: 2) {
+                    ResplitMenu(item: item, model: model)
                     RowAction(icon: "folder.fill", help: "Finder에서 보기") { model.reveal(item) }
                     RowAction(icon: "trash.fill", help: "지우기", tint: .red) { model.delete(item) }
                 }
@@ -400,6 +442,7 @@ struct LibraryRow: View {
         .onTapGesture { if !current { model.open(item.id) } }
         .contextMenu {
             Button("열기") { model.open(item.id) }
+            Menu("다른 방식으로 분리") { ResplitItems(item: item, model: model) }
             Button("Finder에서 보기") { model.reveal(item) }
             if let link = item.link, let url = URL(string: link) {
                 Button("원본 영상 열기") { NSWorkspace.shared.open(url) }
