@@ -82,8 +82,8 @@ enum SplitMode: String, CaseIterable, Identifiable {
     }
     var detail: String {
         switch self {
-        case .hq: "보컬 · 베이스 · 드럼 · 나머지 악기 · 4분 곡에 약 3분"
-        case .hq6: "보컬 · 베이스 · 드럼 · 기타 · 피아노 · 나머지 · 4분 곡에 약 3분"
+        case .hq: "보컬 · 베이스 · 드럼 · 나머지 악기 · 4분 곡에 약 6~8분"
+        case .hq6: "보컬 · 베이스 · 드럼 · 기타 · 피아노 · 나머지 · 4분 곡에 약 8~10분"
         case .ai: "보컬이 조금 덜 깨끗해요 · 4분 곡에 약 20초"
         case .ai6: "기타 · 피아노까지 6개 (이전 방식)"
         case .eq: "주파수로만 자른 이전 방식이라 먹먹해요"

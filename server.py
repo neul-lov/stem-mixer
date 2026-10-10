@@ -258,34 +258,36 @@ def separate_ai(x, job, mode="ai"):
 
 VOCAL_MODEL = "vocals_mel_band_roformer.ckpt"  # MelBand RoFormer (Kimberley Jensen)
 MODEL_DIR = ROOT / "models"
-_vocal_sep = None
 
 
-def roformer_vocals(x, job, p0, p1):
-    """보컬만 RoFormer로 뽑는다. 보컬 품질이 Demucs보다 훨씬 좋다 (덜 먹먹함)."""
-    global _vocal_sep
+_separators = {}  # 모델 파일 이름 -> 불러 둔 audio-separator
+
+
+def run_separator(model_file, x, job, p0, p1, sec_per_sec, step, loading):
+    """audio-separator 모델로 나누기 → {"vocals": …, "drums": …} (파일 이름의 (Stem)으로 구분).
+    진행률 콜백이 없어서 곡 길이로 시간을 어림잡아 p0~p1 사이를 채운다."""
     import logging
+    import re as _re
     import tempfile
     import time
     from audio_separator.separator import Separator
 
     tmp = Path(tempfile.mkdtemp(prefix="stem-", dir=LIBRARY))
     try:
-        if _vocal_sep is None:
-            job["step"] = ("보컬 AI 모델 불러오는 중" if (MODEL_DIR / VOCAL_MODEL).exists()
-                           else "보컬 AI 모델 받는 중 (처음 한 번만 약 900MB)")
-            _vocal_sep = Separator(output_dir=str(tmp), model_file_dir=str(MODEL_DIR),
-                                   log_level=logging.WARNING, output_format="WAV")
-            _vocal_sep.load_model(model_filename=VOCAL_MODEL)
-        sep = _vocal_sep
+        if model_file not in _separators:
+            job["step"] = loading
+            sep = Separator(output_dir=str(tmp), model_file_dir=str(MODEL_DIR),
+                            log_level=logging.WARNING, output_format="WAV")
+            sep.load_model(model_filename=model_file)
+            _separators[model_file] = sep
+        sep = _separators[model_file]
         sep.output_dir = str(tmp)
         if getattr(sep, "model_instance", None) is not None:
             sep.model_instance.output_dir = str(tmp)
         src = tmp / "in.wav"
         sf.write(src, x, SR, subtype="FLOAT")
-        job["step"] = "보컬을 고음질로 뽑는 중"
-        # The separator has no progress callback; estimate from the song length (about 0.4 s per second).
-        expected, t0, stop = max(10.0, len(x) / SR * 0.4), time.time(), threading.Event()
+        job["step"] = step
+        expected, t0, stop = max(10.0, len(x) / SR * sec_per_sec), time.time(), threading.Event()
 
         def tick():
             while not stop.wait(0.5):
@@ -296,36 +298,61 @@ def roformer_vocals(x, job, p0, p1):
             files = sep.separate(str(src))
         finally:
             stop.set()
-        path = next(f for f in files if "(vocals)" in f.lower())
-        path = path if Path(path).is_absolute() else tmp / path
-        vocals, _ = sf.read(path, dtype="float32", always_2d=True)
-        vocals = vocals[: len(x)]
-        if len(vocals) < len(x):
-            vocals = np.pad(vocals, ((0, len(x) - len(vocals)), (0, 0)))
+        out = {}
+        for f in files:
+            path = Path(f) if Path(f).is_absolute() else tmp / f
+            m = _re.search(r"\((\w+)\)", path.name)
+            y, _ = sf.read(path, dtype="float32", always_2d=True)
+            y = y[: len(x)]
+            if len(y) < len(x):
+                y = np.pad(y, ((0, len(x) - len(y)), (0, 0)))
+            out[m.group(1).lower() if m else path.stem] = y
         job["progress"] = p1
-        return vocals
+        return out
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def roformer_vocals(x, job, p0, p1):
+    """보컬만 MelBand RoFormer로 뽑는다."""
+    out = run_separator(VOCAL_MODEL, x, job, p0, p1, 0.4, "보컬을 고음질로 뽑는 중",
+                        "보컬 AI 모델 불러오는 중" if (MODEL_DIR / VOCAL_MODEL).exists()
+                        else "보컬 AI 모델 받는 중 (처음 한 번만 약 900MB)")
+    return out["vocals"]
+
+
+SW_MODEL = "BS-Roformer-SW.ckpt"  # 6개 악기를 한 번에 (MVSEP 기본 모델)
+
+
 def separate_hq(x, job, six=False):
-    """최고 품질: 보컬은 RoFormer, 반주(원곡 - 보컬)는 모델마다 잘하는 악기만 가져온다.
-    MUSDB18 테스트로 잰 결과 드럼은 htdemucs_6s, 베이스는 htdemucs_ft가 가장 좋았다.
-    나머지 악기 = 반주 - (가져온 악기들) 이라서 트랙을 다 더하면 원곡과 같다."""
-    vocals = roformer_vocals(x, job, 0.0, 0.3)
-    inst = x - vocals
-    # 화음 · 더블링 · 효과가 많이 걸린 보컬은 한 번에 다 안 빠지고 "나머지 악기"에 남는다
-    # (실제 곡에서 나머지 악기 안 목소리가 보컬 대비 -12 dB). 남은 소리에서 한 번 더 뽑아 보컬로 옮긴다.
-    job["step"] = "남은 목소리를 한 번 더 뽑는 중"
-    extra = roformer_vocals(inst, job, 0.3, 0.55)
-    job["step"] = "남은 목소리를 한 번 더 뽑는 중"
-    vocals, inst = vocals + extra, inst - extra
-    ft = demucs_split(inst, job, "htdemucs_ft", 0.55, 0.85, "베이스를 나누는 중")
-    s6 = demucs_split(inst, job, "htdemucs_6s", 0.85, 1.0, "드럼 · 기타 · 피아노를 나누는 중")
-    out = {"vocals": vocals, "drums": s6["drums"], "bass": ft["bass"]}
+    """최고 품질 조합 (MUSDB18 테스트 12곡 평균 SDR 9.33, 보컬 끈 반주에 남는 목소리 −66 dB):
+    1) BS-Roformer SW로 보컬 · 드럼 · 베이스 · 기타 · 피아노 · 나머지를 한 번에 나누고
+    2) "나머지 악기"에 남은 목소리를 MelBand RoFormer로 한 번 더 뽑아 보컬로 옮기고
+    3) 베이스만 htdemucs_ft로 바꾼다 (베이스는 htdemucs_ft가 더 잘한다: 8.65 vs 8.09)."""
+    o = run_separator(SW_MODEL, x, job, 0.0, 0.55, 0.85, "악기 6개로 나누는 중 (BS-Roformer SW)",
+                      "분리 AI 모델 불러오는 중" if (MODEL_DIR / SW_MODEL).exists()
+                      else "분리 AI 모델 받는 중 (처음 한 번만 약 700MB)")
+    # SW가 놓친 목소리는 주로 나머지 악기에, 곡에 따라 기타에도 남는다 (실제 곡에서 기타 트랙의 18%가 목소리).
+    # 그 트랙들에서 한 번 더 뽑아 보컬로 옮긴다. 4트랙은 셋을 합친 소리에서 한 번에.
+    vocals = o["vocals"]
     if six:
-        out["guitar"], out["piano"] = s6["guitar"], s6["piano"]
-    out["other"] = inst - sum(out[k] for k in out if k != "vocals")
+        cleaned = {}
+        for i, st in enumerate(("other", "guitar")):
+            job["step"] = "남은 목소리를 한 번 더 뽑는 중"
+            left = roformer_vocals(o[st], job, 0.55 + 0.13 * i, 0.68 + 0.13 * i)
+            vocals, cleaned[st] = vocals + left, o[st] - left
+        other, guitar = cleaned["other"], cleaned["guitar"]
+    else:
+        job["step"] = "남은 목소리를 한 번 더 뽑는 중"
+        rest = o["other"] + o["guitar"] + o["piano"]
+        left = roformer_vocals(rest, job, 0.55, 0.8)
+        vocals, other = vocals + left, rest - left
+    job["step"] = "남은 목소리를 한 번 더 뽑는 중"
+    ft = demucs_split(x - vocals, job, "htdemucs_ft", 0.82, 1.0, "베이스를 나누는 중")
+    other = other + o["bass"] - ft["bass"]  # 베이스를 바꿔도 전체 합은 그대로
+    out = {"vocals": vocals, "drums": o["drums"], "bass": ft["bass"], "other": other}
+    if six:
+        out.update(guitar=guitar, piano=o["piano"])
     return out
 
 

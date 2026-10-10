@@ -85,23 +85,18 @@
 ## 분리 방식과 품질
 | 방식 | 하는 일 | 4분 곡 (Apple Silicon) |
 |---|---|---|
-| **고음질 4트랙** (기본) | 보컬은 MelBand RoFormer, 반주에서 드럼은 htdemucs_6s · 베이스는 htdemucs_ft, 나머지는 남은 소리 전부 | 약 3분 |
-| **고음질 6트랙** | 같은 방식 + 기타 · 피아노는 htdemucs_6s | 약 3분 |
+| **고음질 4트랙** (기본) | BS-Roformer SW로 나누고 → 나머지 악기에 남은 목소리를 MelBand RoFormer로 한 번 더 뽑아 보컬로 → 베이스만 htdemucs_ft | 약 6~8분 |
+| **고음질 6트랙** | 같은 방식 + 기타 · 피아노 (기타에 남은 목소리도 한 번 더 뽑기) | 약 8~10분 |
 | **빠르게** | Demucs htdemucs만 | 약 20초 |
 
-모델마다 잘하는 악기가 달라서(드럼은 htdemucs_6s, 베이스는 htdemucs_ft) 악기별로 가장 좋은 쪽을 가져와요.
-"나머지 악기"는 반주에서 다른 트랙을 뺀 소리라서, 트랙을 전부 더하면 원곡과 같아요.
-화음 · 더블링 · 효과가 많은 보컬은 한 번에 다 안 빠지고 나머지 악기에 남아서(실제 곡에서 보컬 대비 약 −12 dB),
-보컬을 한 번 더 뽑아 보컬 트랙으로 옮겨요. 「ライラック」 커버에서 나머지 악기 안 목소리가 −12 dB → −43 dB로 줄었어요
-(4분 곡에 1분 30초쯤 더 걸려요). 예전에 나눈 곡은 ↻ → "같은 방식으로 다시 분리 (최신 품질)".
+MUSDB18 테스트 곡 12개로 잰 점수 (SDR, dB, 높을수록 깨끗함)와 보컬을 끈 반주에 남는 목소리 (「ライラック」, 낮을수록 좋음):
 
-MUSDB18 테스트 곡 12개로 잰 점수 (SDR, dB, 높을수록 깨끗함):
-
-| | 보컬 | 드럼 | 베이스 | 나머지 | 평균 |
-|---|---|---|---|---|---|
-| 빠르게 (htdemucs) | 9.13 | 7.95 | 8.04 | 4.50 | 7.41 |
-| 이전 6트랙 (htdemucs_6s) | 9.36 | 8.58 | 7.03 | 4.22 | 7.30 |
-| **고음질 4트랙 · 6트랙** | **12.02** | **9.33** | **8.66** | **6.02** | **9.01** |
+| | 보컬 | 드럼 | 베이스 | 나머지 | 평균 | 남은 목소리 |
+|---|---|---|---|---|---|---|
+| 빠르게 (htdemucs) | 9.13 | 7.95 | 8.04 | 4.50 | 7.41 | — |
+| 이전 고음질 (RoFormer 보컬 + Demucs) | 11.98 | 9.44 | 8.67 | 6.06 | 9.04 | −43 dB |
+| BS-Roformer SW 단독 | 12.00 | 10.45 | 8.09 | 6.41 | 9.24 | −34 dB |
+| **지금 고음질** | 11.92 | **10.45** | **8.65** | 6.29 | **9.33** | **−66 dB** |
 
 (6트랙의 기타 · 피아노는 MUSDB에 정답 트랙이 없어서 "나머지"에 합쳐서 쟀어요.)
 
@@ -129,6 +124,7 @@ MUSDB18 테스트 곡 12개로 잰 점수 (SDR, dB, 높을수록 깨끗함):
 | [torchcrepe](https://github.com/maxrmorrison/torchcrepe) | 보컬 · 베이스 음 높이 읽기 | MIT |
 | [basic-pitch](https://github.com/spotify/basic-pitch) (Spotify) | 화음 악기 음표 읽기 | Apache-2.0 |
 | [pretty_midi](https://github.com/craffel/pretty-midi) | MIDI 파일 쓰기 | MIT |
+| [BS-Roformer SW](https://mvsep.com) (jarredou / MVSEP) | 6개 악기 분리 가중치 (처음 실행 때 내려받음) | 명시된 라이선스 없음 — 상업적으로 쓰려면 확인 필요 |
 | [python-audio-separator](https://github.com/nomadkaraoke/python-audio-separator) | RoFormer 모델 실행 | MIT |
 | [MelBand RoFormer 보컬 모델](https://github.com/KimberleyJensen/Mel-Band-Roformer-Vocal-Model) (Kimberley Jensen) | 보컬 분리 가중치 (처음 실행 때 내려받음, 저장소에 포함 안 됨) | 저장소에 명시된 라이선스 없음 — 상업적으로 쓰려면 확인 필요 |
 | [FFmpeg](https://ffmpeg.org) ([imageio-ffmpeg](https://github.com/imageio/imageio-ffmpeg)) | 오디오 변환 (설치할 때 내려받음, 저장소에 포함 안 됨) | LGPL/GPL |
