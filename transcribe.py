@@ -309,6 +309,28 @@ def to_ticks(sec, tempo):
     return int(round(sec * tempo / 60 * TICKS))
 
 
+def find_openutau_singer(prefer=("テト", "Teto", "teto")):
+    """이 Mac의 OpenUtau Singers 폴더에서 가수를 찾는다 (예: 重音テト). 없으면 (None, None).
+    OpenUtau의 가수 id는 Singers 폴더 기준 상대 경로라서 폴더 이름을 그대로 쓴다."""
+    root = Path.home() / "Library" / "OpenUtau" / "Singers"
+    if not root.exists():
+        return None, None
+    found = [c.parent for c in root.rglob("character.txt") if c.parent.parent == root or c.parent == root]
+    found.sort(key=lambda d: (not any(k in d.name for k in prefer), d.name))
+    if not found:
+        return None, None
+    singer = found[0]
+    phonemizer = "OpenUtau.Core.DefaultPhonemizer"
+    cfg = singer / "character.yaml"
+    if cfg.exists():
+        import yaml
+        try:
+            phonemizer = (yaml.safe_load(cfg.read_text(encoding="utf-8-sig")) or {}).get("default_phonemizer") or phonemizer
+        except Exception:
+            pass
+    return str(singer.relative_to(root)), phonemizer
+
+
 def write_ustx(path, notes, tempo, name, waves, lyric="ら"):
     """OpenUtau 프로젝트 (ustx 0.6 형식; OpenUtau가 열 때 최신 형식으로 올려 준다).
     waves = [(트랙 이름, 파일 이름, 길이 ms, 음소거 여부)] — 반주 · 원래 보컬을 같이 넣어서 맞춰 가며 조율."""
@@ -326,7 +348,8 @@ def write_ustx(path, notes, tempo, name, waves, lyric="ら"):
             "phoneme_expressions": [], "phoneme_overrides": [],
         })
     end = max((n["position"] + n["duration"] for n in vnotes), default=TICKS * 4)
-    tracks = [{"singer": "", "phonemizer": "OpenUtau.Core.DefaultPhonemizer",
+    singer, phonemizer = find_openutau_singer()
+    tracks = [{"singer": singer or "", "phonemizer": phonemizer or "OpenUtau.Core.DefaultPhonemizer",
                "renderer_settings": {"renderer": "CLASSIC", "resampler": "worldline"},
                "track_name": name, "track_color": "Pink", "mute": False, "solo": False, "volume": 0, "pan": 0}]
     wave_parts = []

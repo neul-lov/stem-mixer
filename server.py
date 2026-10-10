@@ -161,17 +161,39 @@ def download(url, dest, job):
         if d.get("status") == "downloading" and total:
             job["progress"] = d["downloaded_bytes"] / total
 
-    opts = {
-        **YDL_BASE,
-        "format": "bestaudio/best",
-        "outtmpl": str(dest / "source.%(ext)s"),
-        "ffmpeg_location": FFMPEG,
-        "progress_hooks": [hook],
-    }
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-    src = next(dest.glob("source.*"))
-    return src, info.get("title") or "제목 없음", info.get("webpage_url") or url
+    # YouTube blocks some player clients for some videos (HTTP 403, "format not available",
+    # "page needs to be reloaded"). Try the default first, then other clients, until one works.
+    clients = [None, "default,-web", "web_safari", "mweb", "tv", "android_vr", "ios"]
+    last = None
+    for i, client in enumerate(clients):
+        for f in dest.glob("source.*"):
+            f.unlink()
+        opts = {
+            **YDL_BASE,
+            "format": "bestaudio/best",
+            "outtmpl": str(dest / "source.%(ext)s"),
+            "ffmpeg_location": FFMPEG,
+            "progress_hooks": [hook],
+        }
+        if client:
+            opts["extractor_args"] = {"youtube": {"player_client": client.split(",")}}
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+            src = next((f for f in dest.glob("source.*") if not f.name.endswith((".part", ".ytdl"))), None)
+            if src and src.stat().st_size > 0:
+                return src, info.get("title") or "제목 없음", info.get("webpage_url") or url
+            last = RuntimeError("받은 파일이 비어 있어요")
+        except yt_dlp.utils.DownloadError as e:
+            last = e
+            low = str(e).lower()
+            retryable = ("403" in low or "forbidden" in low or "format is not available" in low
+                         or "page needs to be reloaded" in low or "no video formats" in low)
+            if not ("youtube" in url or "youtu.be" in url) or not retryable:
+                raise
+            if i + 1 < len(clients):
+                job["step"] = f"유튜브가 막아서 다른 방법으로 다시 받는 중 ({i + 2}/{len(clients)})"
+    raise last
 
 
 def decode(path):
@@ -407,6 +429,16 @@ def run_job(job_id, mode, text=None, upload_path=None, title=None, resplit=None)
         low = msg.lower()
         if isinstance(e, UserError):
             pass
+        elif "403" in low or "forbidden" in low:
+            msg = "유튜브가 이 영상 다운로드를 막았어요 (403). 잠시 뒤 다시 시도하거나, 같은 곡의 다른 영상 링크를 넣어 주세요."
+        elif "not a bot" in low or "page needs to be reloaded" in low:
+            msg = "유튜브가 자동 다운로드로 의심해서 막았어요. 잠시 뒤 다시 시도해 주세요."
+        elif "format is not available" in low or "no video formats" in low:
+            msg = "이 영상에서 받을 수 있는 오디오를 찾지 못했어요. 다른 영상 링크를 넣어 주세요."
+        elif "age" in low and ("confirm" in low or "restricted" in low):
+            msg = "연령 제한이 있는 영상이라 받을 수 없어요."
+        elif "live" in low and ("event" in low or "premiere" in low):
+            msg = "아직 시작하지 않은 라이브·최초 공개 영상이에요."
         elif "drm" in low:
             msg = "DRM으로 보호된 음원이라 받을 수 없어요."
         elif "sign in" in low or "private" in low or "members-only" in low:
