@@ -14,7 +14,11 @@ struct PlayerView: View {
                         presets
                         if let stem = model.recordingStem { RecordingBar(stem: stem, model: model) }
                         VStack(spacing: 6) {
-                            ForEach(song.stems, id: \.self) { TrackRow(name: $0, model: model) }
+                            ForEach(song.allTracks, id: \.self) { TrackRow(name: $0, model: model) }
+                        }
+                        if let roll = model.rollStem, song.midi(for: roll) != nil {
+                            PianoRoll(stem: roll, model: model)
+                                .transition(.move(edge: .top).combined(with: .opacity))
                         }
                         SendToApps(model: model)
                     }
@@ -217,6 +221,8 @@ struct TrackRow: View {
     @State private var hovering = false
     @State private var dropping = false
     @State private var showMine = false
+    @State private var showMidi = false
+    private var isMidi: Bool { name.hasSuffix("_midi") }
 
     var body: some View {
         let info = StemInfo.of(name)
@@ -243,6 +249,24 @@ struct TrackRow: View {
                     Text(info.label)
                         .font(.system(size: 13, weight: .semibold))
                     if model.busyStem == name { ProgressView().controlSize(.mini) }
+                }
+                if isMidi, let midi = model.song?.midi(for: name) {
+                    Button { showMidi.toggle() } label: {
+                        HStack(spacing: 3) {
+                            Image(systemName: "pianokeys")
+                            Text("MIDI")
+                        }
+                        .font(.system(size: 9.5, weight: .bold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Capsule().fill(info.color.gradient))
+                    }
+                    .buttonStyle(PressableStyle())
+                    .help("음정 트랙 설정 (소리, 조옮김, MIDI 파일)")
+                    .popover(isPresented: $showMidi, arrowEdge: .bottom) {
+                        MidiSettings(stem: midi.source, midi: midi, model: model)
+                    }
                 }
                 if let mine = model.song?.replaced?[name] {
                     Button { showMine.toggle() } label: {
@@ -328,7 +352,7 @@ struct TrackRow: View {
             }
         }
         .onDrop(of: [.fileURL], isTargeted: $dropping) { providers in
-            guard let provider = providers.first else { return false }
+            guard !isMidi, let provider = providers.first else { return false }
             _ = provider.loadObject(ofClass: URL.self) { url, _ in
                 guard let url else { return }
                 Task { @MainActor in model.replace(name, with: url) }
@@ -336,11 +360,25 @@ struct TrackRow: View {
             return true
         }
         .contextMenu {
-            Button("내 파일로 바꾸기…") { model.chooseReplacement(for: name) }
-            Button("여기에 녹음하기 (헤드폰 추천)") { model.startRecording(name) }
-            if let mine = model.song?.replaced?[name] {
-                Button(mine.use ? "원래 트랙으로 듣기" : "내 트랙으로 듣기") { model.setUseMine(name, !mine.use) }
-                Button("내 트랙 지우기", role: .destructive) { model.removeMine(name) }
+            if isMidi, let midi = model.song?.midi(for: name) {
+                Button("피아노 롤 보기") { model.openRoll(name) }
+                Button("MIDI 파일 복사") { model.copyMidi(midi.source) }
+                Button("음정 트랙 지우기", role: .destructive) { model.removeMidi(midi.source) }
+            } else {
+                Button("내 파일로 바꾸기…") { model.chooseReplacement(for: name) }
+                Button("여기에 녹음하기 (헤드폰 추천)") { model.startRecording(name) }
+                if let mine = model.song?.replaced?[name] {
+                    Button(mine.use ? "원래 트랙으로 듣기" : "내 트랙으로 듣기") { model.setUseMine(name, !mine.use) }
+                    Button("내 트랙 지우기", role: .destructive) { model.removeMine(name) }
+                }
+                if name != "drums" {
+                    Menu(model.song?.midi(for: name) == nil ? "음정 뽑기 (MIDI)" : "음정 다시 뽑기 (MIDI)") {
+                        ForEach(AppModel.midiSounds, id: \.id) { sound in
+                            Button("\(sound.title) 소리로") { model.transcribe(name, sound: sound.id) }
+                        }
+                    }
+                    .disabled(model.job != nil)
+                }
             }
             Divider()
             Button("트랙 파일 복사") { model.copyStem(name) }
@@ -541,5 +579,152 @@ struct RecordingBar: View {
         .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(Color.red.opacity(0.08)))
         .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(Color.red.opacity(0.3), lineWidth: 1))
         .transition(.move(edge: .top).combined(with: .opacity))
+    }
+}
+
+/// Settings for a MIDI track: sound, transpose, key snap, tempo, and the .mid file.
+struct MidiSettings: View {
+    let stem: String
+    let midi: MidiTrack
+    @ObservedObject var model: AppModel
+    @State private var tempo: Double = 120
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                Image(systemName: "pianokeys").foregroundStyle(StemInfo.of(stem).color)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(midi.label ?? "\(StemInfo.of(stem).label) 음정").font(.system(size: 13, weight: .bold))
+                    Text("음표 \(midi.notes)개 · \(midi.key ?? "") · \(Int(midi.tempo ?? 120)) BPM")
+                        .font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
+                }
+            }
+            Picker("", selection: Binding(get: { midi.sound }, set: { model.updateMidi(stem, sound: $0) })) {
+                ForEach(AppModel.midiSounds, id: \.id) { Text($0.title).tag($0.id) }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+
+            HStack {
+                Text("조옮김").font(.system(size: 12, weight: .semibold))
+                Spacer()
+                Button { model.updateMidi(stem, transpose: midi.transpose - 1) } label: { Image(systemName: "minus") }
+                Text(midi.transpose == 0 ? "원래 음" : String(format: "%+d 반음", midi.transpose))
+                    .font(.system(size: 12, weight: .bold)).monospacedDigit().frame(width: 64)
+                Button { model.updateMidi(stem, transpose: midi.transpose + 1) } label: { Image(systemName: "plus") }
+                Button("옥타브↑") { model.updateMidi(stem, transpose: midi.transpose + 12) }
+            }
+            .font(.system(size: 11, weight: .semibold))
+
+            Toggle(isOn: Binding(get: { midi.snap }, set: { model.updateMidi(stem, snap: $0) })) {
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("키에 맞추기 (\(midi.key ?? "?"))").font(.system(size: 12, weight: .semibold))
+                    Text("조성에서 벗어난 음을 가까운 음으로 고쳐요").font(.system(size: 10.5)).foregroundStyle(.secondary)
+                }
+            }
+            .toggleStyle(.switch)
+            .controlSize(.small)
+
+            HStack {
+                Text("빠르기 (MIDI 마디선)").font(.system(size: 12, weight: .semibold))
+                Spacer()
+                Button("½") { tempo = (tempo / 2).rounded(); model.updateMidi(stem, tempo: tempo) }
+                Button("¾") { tempo = (tempo * 0.75).rounded(); model.updateMidi(stem, tempo: tempo) }
+                TextField("", value: $tempo, format: .number)
+                    .frame(width: 46).multilineTextAlignment(.trailing)
+                    .onSubmit { model.updateMidi(stem, tempo: tempo) }
+                Text("BPM").foregroundStyle(.secondary)
+                Button("×2") { tempo = (tempo * 2).rounded(); model.updateMidi(stem, tempo: tempo) }
+            }
+            .font(.system(size: 11, weight: .semibold))
+
+            Divider()
+            HStack(spacing: 8) {
+                FileDragSource(files: { model.namedMidi(stem).map { [$0] } ?? [] }) {
+                    HStack(spacing: 5) {
+                        Image(systemName: "music.note.list")
+                        Text("MIDI 파일 끌어놓기")
+                    }
+                    .font(.system(size: 12, weight: .semibold))
+                    .padding(.horizontal, 10).padding(.vertical, 6)
+                    .background(Capsule().fill(Color.accentColor.opacity(0.14)))
+                    .foregroundStyle(Color.accentColor)
+                }
+                .help("GarageBand · Logic 같은 편집 앱에 끌어 놓으면 아무 악기로나 연주할 수 있어요")
+                Button("복사") { model.copyMidi(stem) }.font(.system(size: 12, weight: .semibold))
+                Spacer()
+                Button("지우기", role: .destructive) { model.removeMidi(stem) }.font(.system(size: 12, weight: .semibold))
+            }
+            Button("피아노 롤 보기") { model.openRoll("\(stem)_midi") }.font(.system(size: 12, weight: .semibold))
+        }
+        .padding(14)
+        .frame(width: 330)
+        .fontDesign(.rounded)
+        .onAppear { tempo = midi.tempo ?? 120 }
+    }
+}
+
+/// The notes of a MIDI track scrolling past the playhead.
+struct PianoRoll: View {
+    let stem: String
+    @ObservedObject var model: AppModel
+    private let before = 2.0, after = 6.0
+
+    var body: some View {
+        let midi = model.song?.midi(for: stem)
+        let info = StemInfo.of(stem)
+        let notes = model.rollNotes
+        let lo = (notes.map(\.pitch).min() ?? 48) - 2, hi = (notes.map(\.pitch).max() ?? 72) + 2
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                SectionTitle(title: "피아노 롤 · \(info.label)", icon: "pianokeys").padding(.horizontal, -10)
+                Text("\(midi?.key ?? "") · \(Int(midi?.tempo ?? 120)) BPM · 음표 \(notes.count)개")
+                    .font(.system(size: 10.5, weight: .semibold)).foregroundStyle(.secondary)
+                    .fixedSize()
+                Button { withAnimation { model.rollStem = nil } } label: {
+                    Image(systemName: "xmark").font(.system(size: 10, weight: .bold)).foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+            }
+            Canvas { ctx, size in
+                let t = model.time, t0 = t - before, span = before + after
+                let rows = CGFloat(max(1, hi - lo))
+                func x(_ s: Double) -> CGFloat { CGFloat((s - t0) / span) * size.width }
+                func y(_ p: Int) -> CGFloat { size.height - CGFloat(p - lo) / rows * size.height }
+                // C rows and black keys as faint stripes.
+                for p in lo...hi {
+                    let black = [1, 3, 6, 8, 10].contains(p % 12)
+                    if black {
+                        ctx.fill(Path(CGRect(x: 0, y: y(p) - size.height / rows / 2, width: size.width, height: size.height / rows)),
+                                 with: .color(.primary.opacity(0.035)))
+                    }
+                    if p % 12 == 0 {
+                        ctx.draw(Text("C\(p / 12 - 1)").font(.system(size: 8, weight: .bold)).foregroundStyle(.secondary),
+                                 at: CGPoint(x: 12, y: y(p)))
+                    }
+                }
+                // Beat lines from the tempo.
+                let beat = 60 / (midi?.tempo ?? 120)
+                var b = (t0 / beat).rounded(.up) * beat
+                while b < t0 + span {
+                    let bar = Int((b / beat).rounded()) % 4 == 0
+                    ctx.fill(Path(CGRect(x: x(b), y: 0, width: bar ? 1 : 0.5, height: size.height)),
+                             with: .color(.primary.opacity(bar ? 0.12 : 0.05)))
+                    b += beat
+                }
+                let h = max(3, size.height / rows - 1)
+                for n in notes where n.end > t0 && n.start < t0 + span {
+                    let rect = CGRect(x: x(n.start), y: y(n.pitch) - h / 2, width: max(2, x(n.end) - x(n.start)), height: h)
+                    let on = n.start <= t && t < n.end
+                    ctx.fill(Path(roundedRect: rect, cornerRadius: min(3, h / 2)),
+                             with: .color(info.color.opacity(on ? 1 : 0.35 + 0.5 * n.velocity)))
+                    if on { ctx.stroke(Path(roundedRect: rect.insetBy(dx: -1, dy: -1), cornerRadius: 3), with: .color(.white.opacity(0.8))) }
+                }
+                ctx.fill(Path(CGRect(x: x(t) - 1, y: 0, width: 2, height: size.height)), with: .color(.accentColor))
+            }
+            .frame(height: 170)
+            .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(Color.primary.opacity(0.035)))
+            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        }
     }
 }

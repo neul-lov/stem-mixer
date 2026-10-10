@@ -11,3 +11,8 @@ torchaudio
 demucs
 audio-separator[cpu]
 audioread
+torchcrepe
+pretty_midi
+# basic-pitch는 오래된 tensorflow 고정 때문에 따로 설치: pip install --no-deps basic-pitch (시작 스크립트가 해 줘요)
+scikit-learn
+mir_eval

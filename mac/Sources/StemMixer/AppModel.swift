@@ -10,7 +10,11 @@ struct StemInfo {
     let color: Color
 
     static func of(_ name: String) -> StemInfo {
-        switch name {
+        if name.hasSuffix("_midi") {
+            let base = of(String(name.dropLast(5)))
+            return StemInfo(label: "\(base.label) 음정", color: base.color)
+        }
+        return switch name {
         case "vocals": StemInfo(label: "보컬", color: Color(red: 0.90, green: 0.28, blue: 0.30))
         case "bass": StemInfo(label: "베이스", color: Color(red: 0.24, green: 0.39, blue: 0.87))
         case "drums": StemInfo(label: "드럼", color: Color(red: 0.96, green: 0.62, blue: 0.04))
@@ -273,12 +277,13 @@ final class AppModel: ObservableObject {
     private func load(_ meta: Song) {
         pause()
         leaveTextField()
+        if song?.id != meta.id { rollStem = nil }
         song = meta
         loadingSong = true
         let saved = UserDefaults.standard.dictionary(forKey: "mix.\(meta.id)") as? [String: Int] ?? [:]
-        tracks = Dictionary(uniqueKeysWithValues: meta.stems.map { ($0, TrackState(volume: saved[$0] ?? 100)) })
+        tracks = Dictionary(uniqueKeysWithValues: meta.allTracks.map { ($0, TrackState(volume: saved[$0] ?? 100)) })
         do {
-            try mixer.load(meta.stems.map { ($0, backend.activeStemURL(meta, $0)) })
+            try mixer.load(meta.allTracks.map { ($0, backend.activeStemURL(meta, $0)) })
             applyGains()
             time = 0
         } catch {
@@ -417,7 +422,7 @@ final class AppModel: ObservableObject {
     }
 
     func apply(_ preset: Preset) {
-        for name in tracks.keys {
+        for name in tracks.keys where !name.hasSuffix("_midi") {  // presets leave MIDI tracks as they are
             tracks[name] = TrackState(volume: preset.volume(for: name))
         }
         applyGains()
@@ -425,7 +430,7 @@ final class AppModel: ObservableObject {
 
     func isActive(_ preset: Preset) -> Bool {
         !tracks.isEmpty && tracks.allSatisfy { name, t in
-            !t.muted && !t.solo && t.volume == preset.volume(for: name)
+            name.hasSuffix("_midi") || (!t.muted && !t.solo && t.volume == preset.volume(for: name))
         }
     }
 
@@ -440,13 +445,13 @@ final class AppModel: ObservableObject {
 
     func exportMix() {
         guard let song, !exporting else { return }
-        let desc = song.stems.map { "\(StemInfo.of($0).label)\(audible($0) ? tracks[$0]!.volume : 0)" }.joined(separator: "_")
+        let desc = song.allTracks.map { "\(StemInfo.of($0).label)\(audible($0) ? tracks[$0]!.volume : 0)" }.joined(separator: "_")
         let panel = NSSavePanel()
         panel.allowedContentTypes = [.wav]
         panel.nameFieldStringValue = "\(song.title)_\(desc).wav".replacingOccurrences(of: "/", with: "-")
         panel.directoryURL = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        let inputs = song.stems.map { (backend.activeStemURL(song, $0), audible($0) ? Double(tracks[$0]!.volume) / 100 : 0) }
+        let inputs = song.allTracks.map { (backend.activeStemURL(song, $0), audible($0) ? Double(tracks[$0]!.volume) / 100 : 0) }
         exporting = true
         Task.detached {
             let result = Result { try Mixer.export(inputs, to: url) }
@@ -613,6 +618,99 @@ final class AppModel: ObservableObject {
         }
     }
 
+    // MARK: Notes (MIDI)
+
+    static let midiSounds: [(id: String, title: String)] = [("piano", "피아노"), ("lead", "신스 리드"), ("sine", "사인"), ("strings", "스트링")]
+
+    /// Which MIDI track's piano roll is open.
+    @Published var rollStem: String?
+    @Published var rollNotes: [MidiNote] = []
+
+    func transcribe(_ stem: String, sound: String) {
+        guard let song, server == .ready, job == nil else { return }
+        let id = song.id
+        jobError = nil
+        withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
+            job = Job(label: "\(song.title) · \(StemInfo.of(stem).label) 음정")
+        }
+        Task {
+            do {
+                let jobID = try await backend.transcribe(id, stem: stem, sound: sound, snap: false)
+                while true {
+                    try await Task.sleep(for: .milliseconds(500))
+                    guard let status = try? await backend.job(jobID) else { continue }
+                    if status.status == "error" { throw BackendError(message: status.error ?? "알 수 없는 오류") }
+                    job?.step = status.step ?? ""
+                    job?.progress = status.progress ?? 0
+                    if status.status == "done" { break }
+                }
+                withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) { job = nil }
+                let meta = try await backend.song(id)
+                if self.song?.id == id {
+                    reload(meta)
+                    tracks["\(stem)_midi"] = TrackState()
+                    applyGains()
+                    openRoll("\(stem)_midi")
+                }
+                show("\(StemInfo.of(stem).label) 음정을 뽑았어요 (음표 \(meta.midi(for: stem)?.notes ?? 0)개)")
+            } catch {
+                withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
+                    job = nil
+                    jobError = error.localizedDescription
+                }
+            }
+        }
+    }
+
+    func updateMidi(_ stem: String, sound: String? = nil, transpose: Int? = nil, snap: Bool? = nil, tempo: Double? = nil) {
+        guard let song else { return }
+        updateUserTrack("\(stem)_midi", "") {
+            try await self.backend.updateMidi(song.id, stem: stem, sound: sound, transpose: transpose, snap: snap, tempo: tempo)
+        }
+        if rollStem == "\(stem)_midi" {
+            Task {
+                try? await Task.sleep(for: .milliseconds(400))
+                for _ in 0..<50 where busyStem != nil { try? await Task.sleep(for: .milliseconds(100)) }
+                openRoll("\(stem)_midi")
+            }
+        }
+    }
+
+    func removeMidi(_ stem: String) {
+        guard let song else { return }
+        if rollStem == "\(stem)_midi" { rollStem = nil }
+        tracks["\(stem)_midi"] = nil
+        updateUserTrack(stem, "음정 트랙을 지웠어요") { try await self.backend.deleteMidi(song.id, stem: stem) }
+    }
+
+    func openRoll(_ extraID: String) {
+        guard let song, let extra = song.midi(for: extraID) else { return }
+        Task {
+            if let notes = try? await backend.midiNotes(song.id, stem: extra.source) {
+                rollNotes = notes
+                withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) { rollStem = extraID }
+            }
+        }
+    }
+
+    /// The .mid file under a readable name, for dragging into an editing app.
+    func namedMidi(_ stem: String) -> URL? {
+        guard let song else { return nil }
+        let source = backend.midiURL(song: song.id, stem: stem)
+        let url = exportCache.appendingPathComponent(song.id, isDirectory: true)
+            .appendingPathComponent("\(safeName(song.title)) - \(StemInfo.of(stem).label) 음정.mid")
+        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? FileManager.default.removeItem(at: url)
+        do { try FileManager.default.copyItem(at: source, to: url) } catch { return nil }
+        return url
+    }
+
+    func copyMidi(_ stem: String) {
+        guard let url = namedMidi(stem) else { return }
+        putOnPasteboard([url])
+        show("MIDI 파일을 복사했어요")
+    }
+
     // MARK: Sending tracks to other apps
 
     private var exportCache: URL {
@@ -644,7 +742,7 @@ final class AppModel: ObservableObject {
 
     func namedStems() -> [URL] {
         guard let song else { return [] }
-        return song.stems.compactMap { namedStem($0, of: song) }
+        return song.allTracks.compactMap { namedStem($0, of: song) }
     }
 
     private func putOnPasteboard(_ urls: [URL]) {
@@ -675,7 +773,7 @@ final class AppModel: ObservableObject {
     var mixSignature: String {
         guard let song else { return "" }
         let user = song.replaced.map { r in r.keys.sorted().map { "\($0)\(r[$0]!.use)\(r[$0]!.nudge)\(r[$0]!.base)\(r[$0]!.name ?? "")" }.joined() } ?? ""
-        return song.id + user + song.stems.map { "\($0)\(audible($0) ? tracks[$0]!.volume : 0)" }.joined()
+        return song.id + user + song.allTracks.map { "\($0)\(audible($0) ? tracks[$0]!.volume : 0)" }.joined()
     }
 
     @Published var renderedMix: (signature: String, url: URL)?
@@ -692,10 +790,10 @@ final class AppModel: ObservableObject {
         guard let song, !renderingMix else { return }
         if let url = currentMixFile { return done(url) }
         let signature = mixSignature
-        let desc = song.stems.map { "\(StemInfo.of($0).label)\(audible($0) ? tracks[$0]!.volume : 0)" }.joined(separator: " ")
+        let desc = song.allTracks.map { "\(StemInfo.of($0).label)\(audible($0) ? tracks[$0]!.volume : 0)" }.joined(separator: " ")
         let dir = exportCache.appendingPathComponent(song.id, isDirectory: true)
         let url = dir.appendingPathComponent("\(safeName(song.title)) - 믹스 (\(desc)).wav")
-        let inputs = song.stems.map { (backend.activeStemURL(song, $0), audible($0) ? Double(tracks[$0]!.volume) / 100 : 0) }
+        let inputs = song.allTracks.map { (backend.activeStemURL(song, $0), audible($0) ? Double(tracks[$0]!.volume) / 100 : 0) }
         renderingMix = true
         Task.detached {
             let result = Result {
@@ -736,13 +834,13 @@ final class AppModel: ObservableObject {
         let dir = base.appendingPathComponent("\(safeName(song.title)) 트랙", isDirectory: true)
         do {
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-            for stem in song.stems {
+            for stem in song.allTracks {
                 let target = dir.appendingPathComponent("\(safeName(song.title)) - \(StemInfo.of(stem).label).wav")
                 try? FileManager.default.removeItem(at: target)
                 try FileManager.default.copyItem(at: backend.activeStemURL(song, stem), to: target)
             }
             NSWorkspace.shared.activateFileViewerSelecting([dir])
-            show("트랙 \(song.stems.count)개를 저장했어요")
+            show("트랙 \(song.allTracks.count)개를 저장했어요")
         } catch {
             show("저장하지 못했어요", success: false)
         }

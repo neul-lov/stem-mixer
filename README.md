@@ -23,6 +23,15 @@
     스피커·마이크 지연은 자동으로 빼 주고, 남은 차이는 싱크 조절로 맞춰요.
   - 트랙 이름 밑의 "내 녹음" 버튼: 원래 트랙과 번갈아 듣기, 싱크 맞추기(−500 ~ +500ms), 다시 녹음, 지우기.
   - 바꾼 트랙은 곡 폴더의 `user/` 에 저장되고, 재생 · 믹스 저장 · 편집 앱으로 보내기에 그대로 쓰여요.
+- **음정 뽑기 (MIDI)**: 트랙 오른쪽 클릭 → "음정 뽑기 (MIDI)" → 소리(피아노 · 신스 리드 · 사인 · 스트링) 고르기.
+  그 트랙의 음 높이와 박자를 읽어서 음표로 만들고, 깔끔한 소리로 다시 연주한 "○○ 음정" 트랙이 생겨요.
+  - 보컬 · 베이스(한 음씩)는 torchcrepe로 음 높이를 읽고, 피아노 · 기타 · 나머지(화음)는 basic-pitch로 읽어요.
+  - "MIDI" 버튼: 소리 바꾸기, 조옮김(반음 · 옥타브), 키에 맞추기, 빠르기(BPM, ½ · ¾ · ×2), MIDI 파일 끌어놓기 · 복사.
+  - 피아노 롤에서 음표가 재생 위치에 맞춰 흘러가요.
+  - 정확도 (알고 있는 멜로디로 합성해서 잰 note F1, 음 시작 ±50ms): 보컬 멜로디 1.00, 반주가 섞인 보컬 0.98,
+    피아노 화음 + 아르페지오 0.95. 4분 곡 기준 보컬 · 베이스 약 30초, 화음 트랙 몇 초.
+  - 원래 음색은 남지 않아요 (음정 · 리듬만). 꺾기 · 바이브레이션은 음표로 정리되면서 일부 사라지고,
+    빽빽한 화음이나 아주 빠른 연주는 덜 정확해요. 빠르기는 곡에 따라 ¾배 · 2배로 잘못 잡힐 수 있어서 직접 고칠 수 있어요.
 - **편집 앱으로 보내기** (GarageBand, Logic, Ableton, FL Studio 등):
   - 트랙 왼쪽 ≡ 를 끌어서 편집 앱 타임라인이나 Finder에 놓으면 그 트랙 wav가 들어가요 ("곡 제목 - 보컬.wav").
   - "모든 트랙 끌어놓기"를 끌면 트랙이 한 번에 들어가요. "지금 믹스 만들기" → "믹스 끌어놓기"로 들리는 그대로도 보낼 수 있어요.
@@ -97,6 +106,9 @@ MUSDB18 테스트 곡 12개로 잰 점수 (SDR, dB, 높을수록 깨끗함):
 | [yt-dlp](https://github.com/yt-dlp/yt-dlp) | 링크에서 오디오 받기 | Unlicense |
 | [PyTorch](https://pytorch.org) | AI 실행 | BSD-3-Clause |
 | [FastAPI](https://fastapi.tiangolo.com) | 로컬 서버 | MIT |
+| [torchcrepe](https://github.com/maxrmorrison/torchcrepe) | 보컬 · 베이스 음 높이 읽기 | MIT |
+| [basic-pitch](https://github.com/spotify/basic-pitch) (Spotify) | 화음 악기 음표 읽기 | Apache-2.0 |
+| [pretty_midi](https://github.com/craffel/pretty-midi) | MIDI 파일 쓰기 | MIT |
 | [python-audio-separator](https://github.com/nomadkaraoke/python-audio-separator) | RoFormer 모델 실행 | MIT |
 | [MelBand RoFormer 보컬 모델](https://github.com/KimberleyJensen/Mel-Band-Roformer-Vocal-Model) (Kimberley Jensen) | 보컬 분리 가중치 (처음 실행 때 내려받음, 저장소에 포함 안 됨) | 저장소에 명시된 라이선스 없음 — 상업적으로 쓰려면 확인 필요 |
 | [FFmpeg](https://ffmpeg.org) ([imageio-ffmpeg](https://github.com/imageio/imageio-ffmpeg)) | 오디오 변환 (설치할 때 내려받음, 저장소에 포함 안 됨) | LGPL/GPL |

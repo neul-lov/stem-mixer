@@ -11,6 +11,28 @@ struct UserTrack: Codable, Equatable {
     var use: Bool
 }
 
+/// Notes read from a stem, played back by the built-in synth as an extra track ("vocals_midi").
+struct MidiTrack: Codable, Equatable, Identifiable {
+    let id: String
+    let source: String
+    var label: String?
+    var sound: String
+    var snap: Bool
+    var transpose: Int
+    var notes: Int
+    var key: String?
+    var tempo: Double?
+}
+
+struct MidiNote: Decodable {
+    let start: Double, end: Double, pitch: Int, velocity: Double
+    init(from decoder: Decoder) throws {
+        var c = try decoder.unkeyedContainer()
+        start = try c.decode(Double.self); end = try c.decode(Double.self)
+        pitch = try c.decode(Int.self); velocity = try c.decode(Double.self)
+    }
+}
+
 struct Song: Codable, Identifiable, Equatable {
     let id: String
     let title: String
@@ -22,6 +44,11 @@ struct Song: Codable, Identifiable, Equatable {
     var link: String?
     var input: String?
     var replaced: [String: UserTrack]?
+    var extras: [MidiTrack]?
+
+    /// Stems plus any MIDI tracks made from them.
+    var allTracks: [String] { stems + (extras ?? []).map(\.id) }
+    func midi(for stem: String) -> MidiTrack? { extras?.first { $0.source == stem || $0.id == stem } }
 
     /// The part of the id shared by every mode's version of this song.
     var key: String { String(id[..<(id.lastIndex(of: "-") ?? id.endIndex)]) }
@@ -98,6 +125,60 @@ final class Backend {
             throw BackendError(message: json?["detail"] as? String ?? "바꾸지 못했어요")
         }
         return try JSONDecoder().decode(Song.self, from: data)
+    }
+
+    func midiURL(song: String, stem: String) -> URL {
+        library.appendingPathComponent(song).appendingPathComponent("midi/\(stem).mid")
+    }
+
+    private func post(_ path: String, _ items: [URLQueryItem]) async throws -> Data {
+        var form = URLComponents()
+        form.queryItems = items
+        var req = URLRequest(url: base_.appendingPathComponent(path))
+        req.httpMethod = "POST"
+        req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        req.httpBody = form.percentEncodedQuery?.replacingOccurrences(of: "+", with: "%2B").data(using: .utf8)
+        let (data, response) = try await URLSession.shared.data(for: req)
+        guard (response as? HTTPURLResponse)?.statusCode == 200 else {
+            let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+            throw BackendError(message: json?["detail"] as? String ?? "요청이 실패했어요")
+        }
+        return data
+    }
+
+    /// Reads a stem's notes into MIDI and a re-synthesized track. Returns the job id.
+    func transcribe(_ songID: String, stem: String, sound: String, snap: Bool) async throws -> String {
+        let data = try await post("api/songs/\(songID)/transcribe", [
+            URLQueryItem(name: "stem", value: stem), URLQueryItem(name: "sound", value: sound),
+            URLQueryItem(name: "snap", value: snap ? "1" : "0"),
+        ])
+        guard let id = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["job_id"] as? String else {
+            throw BackendError(message: "요청이 실패했어요")
+        }
+        return id
+    }
+
+    func updateMidi(_ songID: String, stem: String, sound: String? = nil, transpose: Int? = nil,
+                    snap: Bool? = nil, tempo: Double? = nil) async throws -> Song {
+        var items: [URLQueryItem] = []
+        if let sound { items.append(URLQueryItem(name: "sound", value: sound)) }
+        if let transpose { items.append(URLQueryItem(name: "transpose", value: String(transpose))) }
+        if let snap { items.append(URLQueryItem(name: "snap", value: snap ? "1" : "0")) }
+        if let tempo { items.append(URLQueryItem(name: "tempo", value: String(tempo))) }
+        return try JSONDecoder().decode(Song.self, from: try await post("api/songs/\(songID)/midi/\(stem)", items))
+    }
+
+    func deleteMidi(_ songID: String, stem: String) async throws -> Song {
+        var req = URLRequest(url: base_.appendingPathComponent("api/songs/\(songID)/midi/\(stem)"))
+        req.httpMethod = "DELETE"
+        let (data, _) = try await URLSession.shared.data(for: req)
+        return try JSONDecoder().decode(Song.self, from: data)
+    }
+
+    func midiNotes(_ songID: String, stem: String) async throws -> [MidiNote] {
+        struct R: Decodable { let notes: [MidiNote] }
+        let (data, _) = try await URLSession.shared.data(from: base_.appendingPathComponent("api/songs/\(songID)/midi/\(stem).json"))
+        return try JSONDecoder().decode(R.self, from: data).notes
     }
 
     func removeUserTrack(_ songID: String, stem: String) async throws -> Song {

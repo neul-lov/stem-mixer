@@ -494,9 +494,106 @@ def stem_file(song_id: str, stem: str, original: int = 0):
     meta = json.loads((folder / "meta.json").read_text())
     user = (meta.get("replaced") or {}).get(stem)
     p = folder / "user" / f"{stem}.wav" if user and user.get("use") and not original else folder / f"{stem}.wav"
-    if stem not in STEMS_6 or not p.exists():
+    allowed = set(STEMS_6) | {x["id"] for x in meta.get("extras") or []}
+    if stem not in allowed or not p.exists():
         raise HTTPException(404)
     return FileResponse(p, media_type="audio/wav")
+
+
+# ---------------------------------------------------------------- 음정 뽑기 (MIDI)
+MIDI_LABEL = {"vocals": "보컬 멜로디", "bass": "베이스 라인", "guitar": "기타", "piano": "피아노",
+              "other": "나머지 악기", "drums": "드럼"}
+
+
+def run_transcribe(job_id, song_id, stem, sound, snap):
+    import transcribe as tr
+
+    job = jobs[job_id]
+    try:
+        with work_lock:
+            folder = song_folder(song_id)
+            meta = json.loads((folder / "meta.json").read_text())
+            src = folder / "user" / f"{stem}.wav" if ((meta.get("replaced") or {}).get(stem) or {}).get("use") else folder / f"{stem}.wav"
+            job.update(step="트랙 읽는 중", progress=0.0)
+            y, _ = sf.read(src, dtype="float32", always_2d=True)
+            job["step"] = ("음 높이를 읽는 중" if stem in tr.MONO_STEMS else "화음을 읽는 중 (basic-pitch)")
+            raw = tr.transcribe(y, stem, lambda p: job.update(progress=0.05 + 0.75 * p))
+            job.update(step="조성과 빠르기 찾는 중", progress=0.85)
+            mix = sum(sf.read(folder / f"{n}.wav", dtype="float32", always_2d=True)[0] for n in meta["stems"])
+            tempo = tr.detect_tempo(mix)
+            tonic, mode = tr.detect_key(raw)
+            (folder / "midi").mkdir(exist_ok=True)
+            (folder / "midi" / f"{stem}.json").write_text(json.dumps(
+                {"raw": raw, "key": [tonic, mode], "tempo": tempo}))
+            job.update(step="깔끔한 소리로 다시 연주하는 중", progress=0.92)
+            count = tr.render(folder, stem, sound, 0, snap)
+            extras = [x for x in meta.get("extras") or [] if x["id"] != f"{stem}_midi"]
+            extras.append({"id": f"{stem}_midi", "source": stem, "label": f"{MIDI_LABEL.get(stem, stem)} (MIDI)",
+                           "sound": sound, "snap": snap, "transpose": 0, "notes": count,
+                           "key": tr.key_name(tonic, mode), "tempo": round(tempo)})
+            meta["extras"] = extras
+            (folder / "meta.json").write_text(json.dumps(meta, ensure_ascii=False))
+            job.update(status="done", song_id=song_id, progress=1.0)
+    except Exception as e:
+        traceback.print_exc()
+        job.update(status="error", error=f"음정을 뽑지 못했어요: {str(e).splitlines()[0] if str(e) else type(e).__name__}")
+
+
+@app.post("/api/songs/{song_id}/transcribe")
+def transcribe_stem(song_id: str, stem: str = Form(...), sound: str = Form("piano"), snap: int = Form(0)):
+    import transcribe as tr
+
+    meta = json.loads((song_folder(song_id) / "meta.json").read_text())
+    if stem not in meta["stems"] or stem == "drums" or sound not in tr.SOUNDS:
+        raise HTTPException(400, "이 트랙은 음정을 뽑을 수 없어요")
+    job_id = uuid.uuid4().hex
+    jobs[job_id] = {"status": "running", "step": "대기 중", "progress": 0.0}
+    threading.Thread(target=run_transcribe, args=(job_id, song_id, stem, sound, bool(snap)), daemon=True).start()
+    return {"job_id": job_id}
+
+
+@app.post("/api/songs/{song_id}/midi/{stem}")
+def rerender_midi(song_id: str, stem: str, sound: str = Form(None), transpose: int = Form(None), snap: int = Form(None),
+                  tempo: float = Form(None)):
+    """소리 · 조옮김 · 키 맞추기만 바꿔서 다시 연주 (음정을 다시 읽지 않아 빠름)."""
+    import transcribe as tr
+
+    folder = song_folder(song_id)
+    meta = json.loads((folder / "meta.json").read_text())
+    extra = next((x for x in meta.get("extras") or [] if x["source"] == stem), None)
+    if not extra:
+        raise HTTPException(404, "먼저 음정을 뽑아 주세요")
+    if sound in tr.SOUNDS:
+        extra["sound"] = sound
+    if transpose is not None:
+        extra["transpose"] = max(-24, min(24, transpose))
+    if snap is not None:
+        extra["snap"] = bool(snap)
+    if tempo:
+        extra["tempo"] = round(max(30.0, min(300.0, tempo)), 1)
+    extra["notes"] = tr.render(folder, stem, extra["sound"], extra["transpose"], extra["snap"], extra.get("tempo"))
+    (folder / "meta.json").write_text(json.dumps(meta, ensure_ascii=False))
+    return meta
+
+
+@app.get("/api/songs/{song_id}/midi/{stem}.json")
+def midi_notes(song_id: str, stem: str):
+    p = song_folder(song_id) / "midi" / f"{stem}.json"
+    if not p.exists():
+        raise HTTPException(404)
+    d = json.loads(p.read_text())
+    return {"notes": d.get("notes", d["raw"]), "tempo": d["tempo"]}
+
+
+@app.delete("/api/songs/{song_id}/midi/{stem}")
+def delete_midi(song_id: str, stem: str):
+    folder = song_folder(song_id)
+    meta = json.loads((folder / "meta.json").read_text())
+    meta["extras"] = [x for x in meta.get("extras") or [] if x["source"] != stem]
+    for f in [folder / f"{stem}_midi.wav", *(folder / "midi").glob(f"{stem}.*")] if (folder / "midi").exists() else []:
+        Path(f).unlink(missing_ok=True)
+    (folder / "meta.json").write_text(json.dumps(meta, ensure_ascii=False))
+    return meta
 
 
 # ---------------------------------------------------------------- 내 트랙으로 바꾸기
