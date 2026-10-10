@@ -233,3 +233,64 @@ func formatTime(_ seconds: Double) -> String {
     let s = max(0, Int(seconds))
     return "\(s / 60):" + String(format: "%02d", s % 60)
 }
+
+/// Lets you drag one or more files out of the app (to Finder, GarageBand, Logic, Ableton …).
+/// `files` is asked for at drag start, so it can return files made just then.
+struct FileDragSource<Label: View>: NSViewRepresentable {
+    let files: () -> [URL]
+    @ViewBuilder let label: () -> Label
+
+    func makeNSView(context: Context) -> DragHostView {
+        let view = DragHostView()
+        view.files = files
+        let host = NSHostingView(rootView: AnyView(label()))
+        host.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(host)
+        NSLayoutConstraint.activate([
+            host.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            host.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            host.topAnchor.constraint(equalTo: view.topAnchor),
+            host.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+        ])
+        return view
+    }
+
+    func updateNSView(_ view: DragHostView, context: Context) {
+        view.files = files
+        (view.subviews.first as? NSHostingView<AnyView>)?.rootView = AnyView(label())
+    }
+
+    func sizeThatFits(_ proposal: ProposedViewSize, nsView: DragHostView, context: Context) -> CGSize? {
+        nsView.subviews.first?.fittingSize
+    }
+
+    final class DragHostView: NSView, NSDraggingSource {
+        var files: () -> [URL] = { [] }
+        private var downEvent: NSEvent?
+
+        // Take the mouse ourselves instead of the hosted SwiftUI label.
+        override func hitTest(_ point: NSPoint) -> NSView? { frame.contains(point) ? self : nil }
+        override func mouseDown(with event: NSEvent) { downEvent = event }
+        override func resetCursorRects() { addCursorRect(bounds, cursor: .openHand) }
+
+        override func mouseDragged(with event: NSEvent) {
+            guard let down = downEvent else { return }
+            downEvent = nil
+            let urls = files()
+            guard !urls.isEmpty else { return }
+            let items = urls.enumerated().map { i, url -> NSDraggingItem in
+                let item = NSDraggingItem(pasteboardWriter: url as NSURL)
+                let icon = NSWorkspace.shared.icon(forFile: url.path)
+                let offset = CGFloat(i) * 6
+                item.setDraggingFrame(NSRect(x: offset, y: -offset, width: 40, height: 40), contents: icon)
+                return item
+            }
+            beginDraggingSession(with: items, event: down, source: self)
+        }
+
+        func draggingSession(_ session: NSDraggingSession,
+                             sourceOperationMaskFor context: NSDraggingContext) -> NSDragOperation {
+            context == .outsideApplication ? [.copy] : []
+        }
+    }
+}

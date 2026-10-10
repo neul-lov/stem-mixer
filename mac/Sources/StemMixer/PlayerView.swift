@@ -15,6 +15,7 @@ struct PlayerView: View {
                         VStack(spacing: 6) {
                             ForEach(song.stems, id: \.self) { TrackRow(name: $0, model: model) }
                         }
+                        SendToApps(model: model)
                     }
                     .padding(.horizontal, 24)
                     .padding(.top, 38)
@@ -219,6 +220,17 @@ struct TrackRow: View {
         let state = model.tracks[name] ?? TrackState()
         let audible = model.audible(name)
         HStack(spacing: 14) {
+            FileDragSource(files: { model.song.flatMap { model.namedStem(name, of: $0) }.map { [$0] } ?? [] }) {
+                Image(systemName: "line.3.horizontal")
+                    .font(.system(size: 11, weight: .bold))
+                    .foregroundStyle(.tertiary)
+                    .frame(width: 14, height: 26)
+                    .contentShape(Rectangle())
+            }
+            .frame(width: 14, height: 26)
+            .help("끌어서 편집 앱이나 Finder에 놓기")
+            .padding(.trailing, -6)
+
             HStack(spacing: 8) {
                 Circle()
                     .fill(info.color.gradient)
@@ -251,6 +263,17 @@ struct TrackRow: View {
                 .contentTransition(.numericText())
 
             HStack(spacing: 4) {
+                Button { model.copyStem(name) } label: {
+                    Image(systemName: "doc.on.doc.fill")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 26, height: 26)
+                        .background(RoundedRectangle(cornerRadius: 7, style: .continuous)
+                            .fill(Color.primary.opacity(0.07)))
+                }
+                .buttonStyle(PressableStyle())
+                .help("이 트랙 파일 복사 (Finder 등에 ⌘V)")
+                .opacity(hovering ? 1 : 0)
                 toggle(icon: state.muted ? "speaker.slash.fill" : "speaker.wave.2.fill", on: state.muted,
                        tint: .red, help: "끄기") { model.toggleMute(name) }
                 toggle(icon: "headphones", on: state.solo, tint: .orange, help: "이 트랙만 듣기 (솔로)") {
@@ -266,6 +289,12 @@ struct TrackRow: View {
         )
         .opacity(audible ? 1 : 0.45)
         .animation(.easeOut(duration: 0.15), value: audible)
+        .contextMenu {
+            Button("트랙 파일 복사") { model.copyStem(name) }
+            Button("Finder에서 보기") { model.revealStem(name) }
+            Divider()
+            Button("100%로") { model.setVolume(name, 100) }
+        }
         .onHover { h in withAnimation(.easeOut(duration: 0.15)) { hovering = h } }
     }
 
@@ -283,5 +312,66 @@ struct TrackRow: View {
         }
         .buttonStyle(PressableStyle())
         .help(help)
+    }
+}
+
+/// Getting tracks into GarageBand, Logic, Ableton …: drag, copy, or save to a folder.
+struct SendToApps: View {
+    @ObservedObject var model: AppModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            SectionTitle(title: "편집 앱으로 보내기", icon: "arrow.up.forward.app").padding(.horizontal, -10)
+            HStack(spacing: 8) {
+                FileDragSource(files: { model.namedStems() }) {
+                    chip(icon: "square.stack.3d.up.fill", title: "모든 트랙 끌어놓기", tint: .accentColor)
+                }
+                .help("편집 앱 타임라인에 끌어 놓으면 트랙이 한 번에 들어가요")
+
+                if let mix = model.currentMixFile {
+                    FileDragSource(files: { [mix] }) {
+                        chip(icon: "waveform", title: "믹스 끌어놓기", tint: .green)
+                    }
+                    .help("지금 들리는 그대로 만든 파일이에요")
+                } else {
+                    Button { model.renderMix { _ in } } label: {
+                        chip(icon: model.renderingMix ? "hourglass" : "waveform",
+                             title: model.renderingMix ? "믹스 만드는 중…" : "지금 믹스 만들기", tint: .secondary)
+                    }
+                    .buttonStyle(PressableStyle())
+                    .disabled(model.renderingMix)
+                    .help("지금 설정으로 믹스 파일을 만들면 끌어 놓을 수 있어요")
+                }
+
+                Menu {
+                    Button("모든 트랙 복사") { model.copyAllStems() }
+                    Button("지금 믹스 복사 (⌘C)") { model.copyMix() }
+                    Divider()
+                    Button("모든 트랙을 폴더로 저장…") { model.exportAllStems() }
+                } label: {
+                    chip(icon: "ellipsis", title: "복사 · 저장", tint: .secondary)
+                }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .fixedSize()
+            }
+            Text("트랙 왼쪽 ≡ 를 끌면 그 트랙만 보낼 수 있어요. 복사한 파일은 Finder에 ⌘V로 붙여넣을 수 있어요.")
+                .font(.system(size: 10.5, weight: .medium))
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private func chip(icon: String, title: String, tint: Color) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: icon)
+                .foregroundStyle(tint == .secondary ? AnyShapeStyle(.secondary) : AnyShapeStyle(tint))
+            Text(title)
+        }
+        .font(.system(size: 12, weight: .semibold))
+        .padding(.horizontal, 12)
+        .padding(.vertical, 7)
+        .background(Capsule().fill(tint == .secondary ? Color.primary.opacity(0.06) : tint.opacity(0.14)))
+        .overlay(Capsule().strokeBorder(tint == .secondary ? .clear : tint.opacity(0.35), lineWidth: 1))
+        .contentShape(Capsule())
     }
 }

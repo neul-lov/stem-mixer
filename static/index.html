@@ -60,7 +60,9 @@
   .pct { font-variant-numeric: tabular-nums; text-align: right; font-weight: 600; }
   .pct.zero { color: var(--muted); }
   .tbtns { display: flex; gap: 4px; }
-  .tbtns button { padding: 5px 8px; font-size: 12px; min-width: 34px; }
+  .tbtns button, .tbtns a { padding: 5px 8px; font-size: 12px; min-width: 34px; }
+  .tbtns a { border: 1px solid var(--line); border-radius: 10px; color: var(--text); text-decoration: none;
+             background: var(--card); display: inline-flex; align-items: center; justify-content: center; }
   .tbtns button.on.m { background: var(--danger); border-color: var(--danger); color: #fff; }
   .tbtns button.on.s { background: var(--drums); border-color: var(--drums); color: #000; }
   .track.silent .tname, .track.silent input { opacity: .4; }
@@ -302,10 +304,13 @@ async function openSong(id) {
       <div class="tname"><span class="dot" style="background:${info.color}"></span>${info.label}</div>
       <input type="range" min="0" max="200" step="5" value="100" aria-label="${info.label} 음량">
       <div class="pct">100%</div>
-      <div class="tbtns"><button class="m" title="음소거">끄기</button><button class="s" title="이 트랙만 듣기">솔로</button></div>
+      <div class="tbtns"><button class="m" title="음소거">끄기</button><button class="s" title="이 트랙만 듣기">솔로</button><a class="dl" title="이 트랙 wav 받기 (편집 앱에 넣기)">받기</a></div>
       <div class="meter"><div style="background:${info.color}"></div></div>`;
     row.querySelector("input").oninput = e => { tracks[n].vol = +e.target.value; applyGains(); };
     row.querySelector("input").ondblclick = () => { tracks[n].vol = 100; applyGains(); };
+    const dl = row.querySelector(".dl");
+    dl.href = `/api/songs/${id}/${n}.wav`;
+    dl.download = `${song.title} - ${info.label}.wav`;
     row.querySelector(".m").onclick = () => { tracks[n].mute = !tracks[n].mute; applyGains(); };
     row.querySelector(".s").onclick = () => { tracks[n].solo = !tracks[n].solo; applyGains(); };
     $("tracks").appendChild(row);

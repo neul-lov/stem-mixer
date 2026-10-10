@@ -1,5 +1,6 @@
 import AppKit
 import Carbon
+import MediaPlayer
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -123,6 +124,7 @@ final class AppModel: ObservableObject {
 
     func start() {
         mixer.setMaster(master)
+        setUpMediaKeys()
         guard backend.isInstalled else {
             server = .missing
             return
@@ -252,6 +254,7 @@ final class AppModel: ObservableObject {
 
     private func load(_ meta: Song) {
         pause()
+        leaveTextField()
         song = meta
         loadingSong = true
         let saved = UserDefaults.standard.dictionary(forKey: "mix.\(meta.id)") as? [String: Int] ?? [:]
@@ -294,16 +297,19 @@ final class AppModel: ObservableObject {
 
     func togglePlay() {
         guard song != nil else { return }
+        leaveTextField()
         if mixer.isPlaying { pause() } else {
             mixer.play()
             playing = true
         }
+        updateNowPlaying()
     }
 
     func pause() {
         mixer.pause()
         playing = false
         time = mixer.currentTime
+        updateNowPlaying()
     }
 
     func seek(_ seconds: Double) {
@@ -329,6 +335,39 @@ final class AppModel: ObservableObject {
             next[name] = max(mixer.level(name), (levels[name] ?? 0) * 0.85)
         }
         levels = next
+    }
+
+    // MARK: Media keys
+
+    /// The keyboard's play/pause key, AirPods and Control Center control playback too.
+    private func setUpMediaKeys() {
+        let center = MPRemoteCommandCenter.shared()
+        center.togglePlayPauseCommand.addTarget { [weak self] _ in
+            MainActor.assumeIsolated { self?.togglePlay() }
+            return .success
+        }
+        center.playCommand.addTarget { [weak self] _ in
+            MainActor.assumeIsolated { if self?.playing == false { self?.togglePlay() } }
+            return .success
+        }
+        center.pauseCommand.addTarget { [weak self] _ in
+            MainActor.assumeIsolated { if self?.playing == true { self?.togglePlay() } }
+            return .success
+        }
+    }
+
+    private func updateNowPlaying() {
+        guard let song else {
+            MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+            return
+        }
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = [
+            MPMediaItemPropertyTitle: song.title,
+            MPMediaItemPropertyPlaybackDuration: mixer.duration,
+            MPNowPlayingInfoPropertyElapsedPlaybackTime: mixer.currentTime,
+            MPNowPlayingInfoPropertyPlaybackRate: playing ? 1.0 : 0.0,
+        ]
+        MPNowPlayingInfoCenter.default().playbackState = playing ? .playing : .paused
     }
 
     // MARK: Mix
@@ -398,6 +437,139 @@ final class AppModel: ObservableObject {
         }
     }
 
+    // MARK: Sending tracks to other apps
+
+    private var exportCache: URL {
+        FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("StemMixer/Export", isDirectory: true)
+    }
+
+    private func safeName(_ s: String) -> String {
+        s.replacingOccurrences(of: "/", with: "-").replacingOccurrences(of: ":", with: "-")
+    }
+
+    /// The stem file under a readable name ("곡 제목 - 보컬.wav"), so editing apps name the track sensibly.
+    func namedStem(_ stem: String, of song: Song) -> URL? {
+        let dir = exportCache.appendingPathComponent(song.id, isDirectory: true)
+        let url = dir.appendingPathComponent("\(safeName(song.title)) - \(StemInfo.of(stem).label).wav")
+        let fm = FileManager.default
+        if fm.fileExists(atPath: url.path) { return url }
+        do {
+            try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+            let source = backend.stemURL(song: song.id, stem: stem)
+            // A hard link costs no space; fall back to a copy on another volume.
+            do { try fm.linkItem(at: source, to: url) } catch { try fm.copyItem(at: source, to: url) }
+            return url
+        } catch {
+            return nil
+        }
+    }
+
+    func namedStems() -> [URL] {
+        guard let song else { return [] }
+        return song.stems.compactMap { namedStem($0, of: song) }
+    }
+
+    private func putOnPasteboard(_ urls: [URL]) {
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.writeObjects(urls as [NSURL])
+    }
+
+    func copyStem(_ stem: String) {
+        guard let song, let url = namedStem(stem, of: song) else { return }
+        putOnPasteboard([url])
+        show("\(StemInfo.of(stem).label) 트랙을 복사했어요")
+    }
+
+    func copyAllStems() {
+        let urls = namedStems()
+        guard !urls.isEmpty else { return }
+        putOnPasteboard(urls)
+        show("트랙 \(urls.count)개를 복사했어요")
+    }
+
+    func revealStem(_ stem: String) {
+        guard let song, let url = namedStem(stem, of: song) else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([url])
+    }
+
+    /// Identifies the current mix, so a rendered file is reused until a slider changes.
+    var mixSignature: String {
+        guard let song else { return "" }
+        return song.id + song.stems.map { "\($0)\(audible($0) ? tracks[$0]!.volume : 0)" }.joined()
+    }
+
+    @Published var renderedMix: (signature: String, url: URL)?
+    @Published var renderingMix = false
+
+    var currentMixFile: URL? {
+        guard let rendered = renderedMix, rendered.signature == mixSignature,
+              FileManager.default.fileExists(atPath: rendered.url.path) else { return nil }
+        return rendered.url
+    }
+
+    /// Renders what you hear now into "곡 제목 - 믹스 (보컬0 베이스100 …).wav" in the cache.
+    func renderMix(then done: @escaping (URL) -> Void) {
+        guard let song, !renderingMix else { return }
+        if let url = currentMixFile { return done(url) }
+        let signature = mixSignature
+        let desc = song.stems.map { "\(StemInfo.of($0).label)\(audible($0) ? tracks[$0]!.volume : 0)" }.joined(separator: " ")
+        let dir = exportCache.appendingPathComponent(song.id, isDirectory: true)
+        let url = dir.appendingPathComponent("\(safeName(song.title)) - 믹스 (\(desc)).wav")
+        let inputs = song.stems.map { (backend.stemURL(song: song.id, stem: $0), audible($0) ? Double(tracks[$0]!.volume) / 100 : 0) }
+        renderingMix = true
+        Task.detached {
+            let result = Result {
+                try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+                try Mixer.export(inputs, to: url)
+            }
+            await MainActor.run {
+                self.renderingMix = false
+                switch result {
+                case .success:
+                    self.renderedMix = (signature, url)
+                    done(url)
+                case .failure:
+                    self.show("믹스를 만들지 못했어요", success: false)
+                }
+            }
+        }
+    }
+
+    func copyMix() {
+        renderMix { url in
+            self.putOnPasteboard([url])
+            self.show("지금 믹스를 복사했어요")
+        }
+    }
+
+    /// Saves every stem, named by song and instrument, into a folder you pick.
+    func exportAllStems() {
+        guard let song else { return }
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.prompt = "여기에 저장"
+        panel.message = "트랙 파일을 저장할 폴더를 고르세요"
+        panel.directoryURL = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
+        guard panel.runModal() == .OK, let base = panel.url else { return }
+        let dir = base.appendingPathComponent("\(safeName(song.title)) 트랙", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            for stem in song.stems {
+                let target = dir.appendingPathComponent("\(safeName(song.title)) - \(StemInfo.of(stem).label).wav")
+                try? FileManager.default.removeItem(at: target)
+                try FileManager.default.copyItem(at: backend.stemURL(song: song.id, stem: stem), to: target)
+            }
+            NSWorkspace.shared.activateFileViewerSelecting([dir])
+            show("트랙 \(song.stems.count)개를 저장했어요")
+        } catch {
+            show("저장하지 못했어요", success: false)
+        }
+    }
+
     // MARK: Toast
 
     @Published var toastIsSuccess = true
@@ -418,9 +590,27 @@ final class AppModel: ObservableObject {
     // MARK: Keyboard
 
     /// Shortcuts that work anywhere in the window except while typing in the link field.
+    func leaveTextField(_ window: NSWindow? = nil) {
+        (window ?? NSApp.keyWindow)?.makeFirstResponder(nil)
+    }
+
     func handle(_ event: NSEvent) -> Bool {
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-        let typing = NSApp.keyWindow?.firstResponder is NSTextView
+        let window = event.window ?? NSApp.keyWindow
+        var typing = window?.firstResponder is NSTextView
+        // An empty, focused link field shouldn't swallow Space: leave the field and play instead.
+        if typing, input.isEmpty, song != nil, event.keyCode == UInt16(kVK_Space), flags.isEmpty {
+            leaveTextField(window)
+            typing = false
+        }
+        if typing, event.keyCode == UInt16(kVK_Escape) {
+            leaveTextField(window)
+            return true
+        }
+        if flags == .command, event.keyCode == UInt16(kVK_ANSI_C), !typing, song != nil {
+            copyMix()
+            return true
+        }
         if flags == .command, event.keyCode == UInt16(kVK_ANSI_V), !typing,
            let text = NSPasteboard.general.string(forType: .string) {
             input = text.trimmingCharacters(in: .whitespacesAndNewlines)
