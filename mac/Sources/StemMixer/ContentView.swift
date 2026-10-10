@@ -83,6 +83,7 @@ struct Sidebar: View {
             footer
         }
         .onChange(of: model.focusToken) { inputFocused = true }
+        .sheet(isPresented: $model.showStorage) { StorageView(model: model) }
     }
 
     private var header: some View {
@@ -128,6 +129,7 @@ struct Sidebar: View {
             }
             Divider()
             Button("음악 파일 선택…") { model.chooseFile() }
+            Button("저장 공간 관리…") { model.showStorage = true }
             Button("분리한 곡 폴더 열기") { NSWorkspace.shared.open(model.backend.library) }
             Button("서버 로그 보기") { NSWorkspace.shared.open(model.backend.log) }
             Divider()
@@ -491,9 +493,161 @@ struct LibraryRow: View {
             Text(SplitMode.label(item.mode))
             Text("·")
             Text(formatTime(item.duration))
+            if let size = item.size {
+                Text("·")
+                Text(AppModel.bytes(size))
+            }
         }
         .font(.system(size: 10.5, weight: .medium))
         .foregroundStyle(.secondary)
         .lineLimit(1)
+    }
+}
+
+/// Which songs take how much space, and deleting several at once.
+struct StorageView: View {
+    @ObservedObject var model: AppModel
+    @Environment(\.dismiss) private var dismiss
+    @State private var selected = Set<String>()
+
+    private var sorted: [Song] { model.songs.sorted { ($0.size ?? 0) > ($1.size ?? 0) } }
+    private var selectedSize: Int64 { model.songs.filter { selected.contains($0.id) }.reduce(0) { $0 + ($1.size ?? 0) } }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 10) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .fill(LinearGradient(colors: [.accentColor, .accentColor.opacity(0.7)], startPoint: .topLeading, endPoint: .bottomTrailing))
+                        .frame(width: 26, height: 26)
+                    Image(systemName: "internaldrive.fill").font(.system(size: 12, weight: .bold)).foregroundStyle(.white)
+                }
+                VStack(alignment: .leading, spacing: 0) {
+                    Text("저장 공간").font(.system(size: 15, weight: .bold))
+                    Text(summary).font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("닫기") { dismiss() }.keyboardShortcut(.cancelAction)
+            }
+            .padding(16)
+
+            if let s = model.storage {
+                let leftovers = s.leftovers + model.cacheSize
+                HStack(spacing: 10) {
+                    Image(systemName: "sparkles").foregroundStyle(Color.accentColor)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("정리할 수 있는 파일 \(AppModel.bytes(leftovers))").font(.system(size: 12.5, weight: .semibold))
+                        Text("끌어놓기용 임시 파일, 지운 곡의 원본, 끝난 작업이 남긴 파일 (곡은 안 지워요)")
+                            .font(.system(size: 10.5)).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button("정리하기") { model.cleanUp() }.disabled(leftovers == 0)
+                }
+                .padding(12)
+                .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(Color.accentColor.opacity(0.08)))
+                .padding(.horizontal, 12)
+            }
+
+            HStack(spacing: 6) {
+                SectionTitle(title: "곡 (큰 순서)", icon: "music.note.list")
+                Spacer()
+                Menu("빠르게 고르기") {
+                    Button("이전 방식으로 나눈 곡 (빠르게 · 필터 · 6트랙 이전)") {
+                        selected = Set(model.songs.filter { ["ai", "ai6", "eq"].contains($0.mode) }.map(\.id))
+                    }
+                    Button("같은 곡의 다른 버전 (가장 최근 것만 남기기)") {
+                        var seen = Set<String>()
+                        selected = Set(model.songs.sorted { ($0.created ?? 0) > ($1.created ?? 0) }.compactMap { s in
+                            seen.insert(s.key).inserted ? nil : s.id
+                        })
+                    }
+                    Button("30일 넘은 곡") {
+                        let cutoff = Date().timeIntervalSince1970 - 30 * 86400
+                        selected = Set(model.songs.filter { ($0.created ?? .infinity) < cutoff }.map(\.id))
+                    }
+                    Divider()
+                    Button("모두 선택") { selected = Set(model.songs.map(\.id)) }
+                    Button("선택 해제") { selected = [] }
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                .font(.system(size: 11.5, weight: .semibold))
+                .padding(.trailing, 14)
+            }
+            .padding(.top, 8)
+
+            ScrollView {
+                LazyVStack(spacing: 2) {
+                    ForEach(sorted) { item in row(item) }
+                }
+                .padding(.horizontal, 8)
+            }
+            .frame(minHeight: 260)
+
+            HStack {
+                Text(selected.isEmpty ? "지울 곡을 고르세요" : "\(selected.count)곡 선택 · \(AppModel.bytes(selectedSize))")
+                    .font(.system(size: 12, weight: .semibold)).foregroundStyle(.secondary)
+                    .contentTransition(.numericText())
+                Spacer()
+                Button {
+                    model.deleteSongs(selected)
+                    selected = []
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "trash.fill")
+                        Text("선택한 곡 지우기")
+                    }
+                    .font(.system(size: 12.5, weight: .bold))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 14).padding(.vertical, 7)
+                    .background(Capsule().fill(Color.red.gradient))
+                    .opacity(selected.isEmpty ? 0.4 : 1)
+                }
+                .buttonStyle(PressableStyle())
+                .disabled(selected.isEmpty)
+            }
+            .padding(14)
+            .background(alignment: .top) { Rectangle().fill(Color.primary.opacity(0.08)).frame(height: 0.5) }
+        }
+        .frame(width: 520, height: 560)
+        .fontDesign(.rounded)
+        .task { await model.refreshStorage() }
+    }
+
+    private var summary: String {
+        guard let s = model.storage else { return "계산 중…" }
+        return "곡 \(model.songs.count)개 \(AppModel.bytes(s.songs)) · 원본 \(AppModel.bytes(s.sources)) · AI 모델 \(AppModel.bytes(s.models))"
+    }
+
+    private func row(_ item: Song) -> some View {
+        let on = selected.contains(item.id)
+        return HStack(spacing: 10) {
+            Image(systemName: on ? "checkmark.circle.fill" : "circle")
+                .font(.system(size: 16))
+                .foregroundStyle(on ? Color.red : Color.secondary.opacity(0.6))
+            VStack(alignment: .leading, spacing: 2) {
+                Text(item.title).font(.system(size: 12.5, weight: .medium)).lineLimit(1)
+                HStack(spacing: 4) {
+                    Text(SplitMode.label(item.mode))
+                    if let c = item.created {
+                        Text("·")
+                        Text(Date(timeIntervalSince1970: c).formatted(.dateTime.month().day()))
+                    }
+                    if item.replaced?.isEmpty == false || item.extras?.isEmpty == false {
+                        Text("·")
+                        Text("내 녹음/MIDI 있음").foregroundStyle(Color.accentColor)
+                    }
+                }
+                .font(.system(size: 10.5, weight: .medium)).foregroundStyle(.secondary)
+            }
+            Spacer()
+            Text(AppModel.bytes(item.size ?? 0))
+                .font(.system(size: 12, weight: .bold)).monospacedDigit()
+                .foregroundStyle((item.size ?? 0) > 400_000_000 ? .primary : .secondary)
+        }
+        .padding(.horizontal, 10).padding(.vertical, 7)
+        .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(on ? Color.red.opacity(0.08) : .clear))
+        .contentShape(Rectangle())
+        .onTapGesture { if on { selected.remove(item.id) } else { selected.insert(item.id) } }
     }
 }

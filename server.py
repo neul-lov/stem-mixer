@@ -513,9 +513,78 @@ def job_status(job_id: str):
 
 @app.get("/api/songs")
 def list_songs():
-    metas = [json.loads(p.read_text()) for p in LIBRARY.glob("*/meta.json")]
+    metas = []
+    for p in LIBRARY.glob("*/meta.json"):
+        m = json.loads(p.read_text())
+        m["size"] = folder_size(p.parent)
+        m["created"] = p.stat().st_mtime
+        metas.append(m)
     metas.sort(key=lambda m: (LIBRARY / m["id"]).stat().st_mtime, reverse=True)
     return metas
+
+
+# ---------------------------------------------------------------- 저장 공간
+def folder_size(path):
+    total = 0
+    for root, _, files in os.walk(path):
+        for f in files:
+            try:
+                total += os.lstat(os.path.join(root, f)).st_size
+            except OSError:
+                pass
+    return total
+
+
+def _leftovers():
+    """지워도 되는 것: 버전이 하나도 안 남은 곡의 원본, 끝난 작업이 남긴 임시 파일."""
+    busy = any(j.get("status") == "running" for j in jobs.values())
+    keys = {p.parent.name.rsplit("-", 1)[0] for p in LIBRARY.glob("*/meta.json")}
+    orphans = [f for f in SOURCES.iterdir() if f.is_file() and f.stem not in keys]
+    temp = [] if busy else [d for d in LIBRARY.iterdir()
+                            if d.name.startswith(("stem-", "_upload_")) or
+                            (d.is_dir() and d.name not in ("_sources",) and not (d / "meta.json").exists())]
+    return orphans, temp, busy
+
+
+@app.get("/api/storage")
+def storage():
+    orphans, temp, busy = _leftovers()
+    songs = sum(folder_size(p.parent) for p in LIBRARY.glob("*/meta.json"))
+    return {
+        "songs": songs,
+        "sources": folder_size(SOURCES),
+        "leftovers": sum(f.stat().st_size for f in orphans) + sum(folder_size(d) if d.is_dir() else d.stat().st_size for d in temp),
+        "models": folder_size(MODEL_DIR) if MODEL_DIR.exists() else 0,
+        "busy": busy,
+    }
+
+
+@app.post("/api/cleanup")
+def cleanup():
+    """남은 원본 · 임시 파일만 지운다. 분리 중이면 임시 파일은 건드리지 않는다."""
+    orphans, temp, busy = _leftovers()
+    freed = 0
+    for f in orphans:
+        freed += f.stat().st_size
+        f.unlink()
+    for d in temp:
+        freed += folder_size(d) if d.is_dir() else d.stat().st_size
+        shutil.rmtree(d, ignore_errors=True) if d.is_dir() else d.unlink()
+    return {"freed": freed, "skipped_temp_because_busy": busy}
+
+
+@app.post("/api/songs/delete-many")
+def delete_many(ids: str = Form(...)):
+    """여러 곡 한 번에 지우기 (ids: 쉼표로 구분)."""
+    freed, done = 0, []
+    for sid in [i for i in ids.split(",") if i]:
+        folder = (LIBRARY / sid).resolve()
+        if folder.parent != LIBRARY.resolve() or not (folder / "meta.json").exists():
+            continue
+        freed += folder_size(folder)
+        delete_song(sid)
+        done.append(sid)
+    return {"deleted": done, "freed": freed}
 
 
 @app.get("/api/songs/{song_id}")

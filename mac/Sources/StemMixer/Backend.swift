@@ -45,6 +45,8 @@ struct Song: Codable, Identifiable, Equatable {
     var input: String?
     var replaced: [String: UserTrack]?
     var extras: [MidiTrack]?
+    var size: Int64?
+    var created: Double?
 
     /// Stems plus any MIDI tracks made from them.
     var allTracks: [String] { stems + (extras ?? []).map(\.id) }
@@ -284,6 +286,26 @@ final class Backend {
             throw BackendError(message: json?["detail"] as? String ?? "요청이 실패했어요")
         }
         return id
+    }
+
+    struct Storage: Decodable { let songs: Int64; let sources: Int64; let leftovers: Int64; let models: Int64; let busy: Bool }
+
+    func storage() async throws -> Storage {
+        let (data, _) = try await URLSession.shared.data(from: base.appendingPathComponent("api/storage"))
+        return try JSONDecoder().decode(Storage.self, from: data)
+    }
+
+    /// Removes left-over originals and temp files. Returns bytes freed.
+    func cleanup() async throws -> Int64 {
+        var req = URLRequest(url: base.appendingPathComponent("api/cleanup"))
+        req.httpMethod = "POST"
+        let (data, _) = try await URLSession.shared.data(for: req)
+        return ((try? JSONSerialization.jsonObject(with: data)) as? [String: Any])?["freed"] as? Int64 ?? 0
+    }
+
+    func deleteMany(_ ids: [String]) async throws -> Int64 {
+        let data = try await post("api/songs/delete-many", [URLQueryItem(name: "ids", value: ids.joined(separator: ","))])
+        return ((try? JSONSerialization.jsonObject(with: data)) as? [String: Any])?["freed"] as? Int64 ?? 0
     }
 
     func job(_ id: String) async throws -> JobStatus {

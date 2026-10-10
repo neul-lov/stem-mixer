@@ -322,6 +322,68 @@ final class AppModel: ObservableObject {
         }
     }
 
+    // MARK: Storage
+
+    @Published var showStorage = false
+    @Published var storage: Backend.Storage?
+    @Published var cacheSize: Int64 = 0
+
+    static func bytes(_ n: Int64) -> String {
+        ByteCountFormatter.string(fromByteCount: n, countStyle: .file)
+    }
+
+    func refreshStorage() async {
+        await refreshSongs()
+        storage = try? await backend.storage()
+        cacheSize = Int64(Self.folderSize(exportCache))
+    }
+
+    private static func folderSize(_ url: URL) -> Int {
+        guard let e = FileManager.default.enumerator(at: url, includingPropertiesForKeys: [.fileSizeKey, .isSymbolicLinkKey]) else { return 0 }
+        var total = 0
+        for case let f as URL in e {
+            let v = try? f.resourceValues(forKeys: [.fileSizeKey, .isSymbolicLinkKey])
+            if v?.isSymbolicLink != true { total += v?.fileSize ?? 0 }
+        }
+        return total
+    }
+
+    func deleteSongs(_ ids: Set<String>) {
+        guard !ids.isEmpty else { return }
+        let names = songs.filter { ids.contains($0.id) }
+        let total = names.reduce(Int64(0)) { $0 + ($1.size ?? 0) }
+        let alert = NSAlert()
+        alert.messageText = "\(ids.count)곡을 지울까요?"
+        alert.informativeText = "\(Self.bytes(total))가 비워져요. 분리한 트랙 · 내 녹음 · MIDI가 같이 지워지고 되돌릴 수 없어요."
+        alert.addButton(withTitle: "지우기")
+        alert.addButton(withTitle: "취소")
+        alert.buttons.first?.hasDestructiveAction = true
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        if let id = song?.id, ids.contains(id) {
+            mixer.unload()
+            song = nil
+            playing = false
+        }
+        Task {
+            let freed = (try? await backend.deleteMany(Array(ids))) ?? 0
+            await refreshStorage()
+            show("\(ids.count)곡 지움 · \(Self.bytes(freed)) 비움")
+        }
+    }
+
+    /// Left-over originals, temp files and the drag/copy cache (rebuilt when needed).
+    func cleanUp() {
+        Task {
+            var freed = (try? await backend.cleanup()) ?? 0
+            let cache = exportCache.deletingLastPathComponent()
+            freed += Int64(Self.folderSize(exportCache))
+            try? FileManager.default.removeItem(at: cache.appendingPathComponent("Export"))
+            renderedMix = nil
+            await refreshStorage()
+            show("\(Self.bytes(freed)) 비웠어요")
+        }
+    }
+
     func reveal(_ item: Song) {
         NSWorkspace.shared.activateFileViewerSelecting([backend.library.appendingPathComponent(item.id)])
     }
