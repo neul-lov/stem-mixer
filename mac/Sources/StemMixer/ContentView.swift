@@ -563,7 +563,7 @@ struct StorageView: View {
                         Image(systemName: "arrow.down.right.and.arrow.up.left").foregroundStyle(Color.green)
                         VStack(alignment: .leading, spacing: 1) {
                             Text(model.compacting.map { "\($0.step) · \(Int($0.progress * 100))%" }
-                                 ?? "예전 곡 트랙 \(AppModel.bytes(s.wav ?? 0)) → 약 절반으로")
+                                 ?? "예전 곡 트랙 \(AppModel.bytes(s.wav ?? 0)) → 40% 가까이 줄어요")
                                 .font(.system(size: 12.5, weight: .semibold)).monospacedDigit()
                             Text("소리 손실 없는 FLAC으로 바꿔요. 바꾼 뒤 샘플이 똑같은지 확인하고 원래 파일을 지워요. 새로 나누는 곡은 처음부터 FLAC이에요.")
                                 .font(.system(size: 10.5)).foregroundStyle(.secondary)

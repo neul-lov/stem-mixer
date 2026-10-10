@@ -117,7 +117,7 @@ final class Backend {
         trackFile(library.appendingPathComponent(song).appendingPathComponent("user"), stem)
     }
 
-    /// Tracks are saved as FLAC (same sound, about half the size); songs from before are still wav.
+    /// Tracks are saved as FLAC (same sound, about 60% of the size); songs from before are still wav.
     private func trackFile(_ dir: URL, _ name: String) -> URL {
         let flac = dir.appendingPathComponent("\(name).flac")
         return FileManager.default.fileExists(atPath: flac.path) ? flac : dir.appendingPathComponent("\(name).wav")
@@ -389,7 +389,7 @@ final class Backend {
 
     struct Storage: Decodable {
         let songs: Int64; let sources: Int64; let leftovers: Int64; let models: Int64; let busy: Bool
-        /// Tracks still saved as wav (FLAC would make them about half).
+        /// Tracks still saved as wav (FLAC saves close to 40%).
         let wav: Int64?
     }
 

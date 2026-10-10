@@ -481,7 +481,7 @@ def run_job(job_id, mode, text=None, upload_path=None, title=None, resplit=None)
             job.update(step="저장 중", progress=0.99)
             peak = max(float(np.abs(s).max()) for s in stems.values())
             scale = 0.99 / peak if peak > 0.99 else 1.0
-            for name in names:  # FLAC: 소리는 wav와 똑같고 크기는 절반쯤
+            for name in names:  # FLAC: 소리는 wav와 똑같고 크기는 60% 정도
                 audiofile.write(folder, name, stems[name] * scale)
             shutil.rmtree(folder / "pitch", ignore_errors=True)  # 다시 나눴으면 음높이 선도 다시
             if not kept_source(key):  # 다음에 다른 방식으로 나눌 때 쓰도록 원본 보관
@@ -662,7 +662,7 @@ def cleanup():
 
 
 def _wav_tracks():
-    """예전에 wav로 저장한 트랙 (FLAC으로 바꾸면 절반쯤으로 줄어든다)."""
+    """예전에 wav로 저장한 트랙 (FLAC으로 바꾸면 40% 가까이 줄어든다)."""
     out = []
     for p in LIBRARY.glob("*/meta.json"):
         try:

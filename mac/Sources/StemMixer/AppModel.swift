@@ -412,7 +412,7 @@ final class AppModel: ObservableObject {
     /// Progress of turning old wav tracks into FLAC (nil when not running).
     @Published var compacting: (step: String, progress: Double)?
 
-    /// Converts every old wav track to FLAC: same sound, about half the space.
+    /// Converts every old wav track to FLAC: same sound, close to 40% less space.
     func compactLibrary() {
         guard compacting == nil else { return }
         compacting = ("시작하는 중", 0)
