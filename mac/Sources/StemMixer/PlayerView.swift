@@ -5,7 +5,10 @@ struct PlayerView: View {
     @State private var scrub: Double?
 
     var body: some View {
-        if let song = model.song {
+        if let editor = model.editor, model.song != nil {
+            NoteEditorView(editor: editor, model: model)
+                .transition(.opacity)
+        } else if let song = model.song {
             VStack(spacing: 0) {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 18) {
@@ -344,7 +347,7 @@ struct TrackRow: View {
         )
         .overlay {
             if dropping {
-                Text("놓으면 \(info.label)을 이 파일로 바꿔요")
+                Text(isMidi ? "MIDI · UST 파일을 놓으면 음표 편집으로 열어요" : "놓으면 \(info.label)을 이 파일로 바꿔요 (MIDI · UST는 음표로)")
                     .font(.system(size: 12, weight: .bold))
                     .foregroundStyle(Color.accentColor)
                     .padding(.horizontal, 10).padding(.vertical, 4)
@@ -352,16 +355,25 @@ struct TrackRow: View {
             }
         }
         .onDrop(of: [.fileURL], isTargeted: $dropping) { providers in
-            guard !isMidi, let provider = providers.first else { return false }
+            guard let provider = providers.first else { return false }
+            let stem = isMidi ? String(name.dropLast(5)) : name
             _ = provider.loadObject(ofClass: URL.self) { url, _ in
                 guard let url else { return }
-                Task { @MainActor in model.replace(name, with: url) }
+                Task { @MainActor in
+                    if AppModel.isNoteFile(url) {
+                        if stem != "drums" { model.importNotesFile(url, stem: stem) }
+                    } else if !isMidi {
+                        model.replace(name, with: url)
+                    }
+                }
             }
             return true
         }
         .contextMenu {
             if isMidi, let midi = model.song?.midi(for: name) {
+                Button("음표 편집") { model.editNotes(midi.source) }
                 Button("피아노 롤 보기") { model.openRoll(name) }
+                Button("MIDI · UST 파일 가져오기…") { model.importNotes(for: midi.source) }
                 Button("MIDI 파일 복사") { model.copyMidi(midi.source) }
                 if midi.source == "vocals" || midi.source == "bass" {
                     Button("OpenUtau · UTAU로 내보내기…") { model.exportUtau(midi.source, quantize: false) }
@@ -375,6 +387,17 @@ struct TrackRow: View {
                     Button("내 트랙 지우기", role: .destructive) { model.removeMine(name) }
                 }
                 if name != "drums" {
+                    Divider()
+                    if model.song?.midi(for: name) != nil {
+                        Button("음표 편집") { model.editNotes(name) }
+                    } else {
+                        Menu("음표 편집") {
+                            Button("AI로 음정 뽑아서 편집") { model.transcribe(name, sound: "piano", thenEdit: true) }
+                                .disabled(model.job != nil)
+                            Button("빈 악보로 시작") { model.editNotes(name) }
+                        }
+                    }
+                    Button("MIDI · UST 파일 가져오기…") { model.importNotes(for: name) }
                     Menu(model.song?.midi(for: name) == nil ? "음정 뽑기 (MIDI)" : "음정 다시 뽑기 (MIDI)") {
                         ForEach(AppModel.midiSounds, id: \.id) { sound in
                             Button("\(sound.title) 소리로") { model.transcribe(name, sound: sound.id) }
@@ -658,7 +681,12 @@ struct MidiSettings: View {
                 Spacer()
                 Button("지우기", role: .destructive) { model.removeMidi(stem) }.font(.system(size: 12, weight: .semibold))
             }
-            Button("피아노 롤 보기") { model.openRoll("\(stem)_midi") }.font(.system(size: 12, weight: .semibold))
+            HStack(spacing: 10) {
+                Button("음표 편집") { model.editNotes(stem) }
+                Button("피아노 롤 보기") { model.openRoll("\(stem)_midi") }
+                Button("파일 가져오기…") { model.importNotes(for: stem) }
+            }
+            .font(.system(size: 12, weight: .semibold))
             if stem == "vocals" || stem == "bass" {
                 Divider()
                 VStack(alignment: .leading, spacing: 6) {
@@ -699,6 +727,21 @@ struct PianoRoll: View {
                 Text("\(midi?.key ?? "") · \(Int(midi?.tempo ?? 120)) BPM · 음표 \(notes.count)개")
                     .font(.system(size: 10.5, weight: .semibold)).foregroundStyle(.secondary)
                     .fixedSize()
+                Spacer()
+                if let midi {
+                    Button { model.editNotes(midi.source) } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: "pencil")
+                            Text("편집")
+                        }
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(Color.accentColor)
+                        .padding(.horizontal, 8).padding(.vertical, 3)
+                        .background(Capsule().fill(Color.accentColor.opacity(0.12)))
+                    }
+                    .buttonStyle(PressableStyle())
+                    .help("음표를 직접 고치기")
+                }
                 Button { withAnimation { model.rollStem = nil } } label: {
                     Image(systemName: "xmark").font(.system(size: 10, weight: .bold)).foregroundStyle(.secondary)
                 }

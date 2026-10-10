@@ -22,14 +22,25 @@ struct MidiTrack: Codable, Equatable, Identifiable {
     var notes: Int
     var key: String?
     var tempo: Double?
+    /// The notes were changed in the editor (or imported), so "AI 음표로 되돌리기" is possible.
+    var edited: Bool?
 }
 
-struct MidiNote: Decodable {
-    let start: Double, end: Double, pitch: Int, velocity: Double
+/// [start, end, pitch, velocity] on the wire.
+struct MidiNote: Codable, Equatable {
+    var start: Double, end: Double, pitch: Int, velocity: Double
+    init(start: Double, end: Double, pitch: Int, velocity: Double) {
+        self.start = start; self.end = end; self.pitch = pitch; self.velocity = velocity
+    }
     init(from decoder: Decoder) throws {
         var c = try decoder.unkeyedContainer()
         start = try c.decode(Double.self); end = try c.decode(Double.self)
         pitch = try c.decode(Int.self); velocity = try c.decode(Double.self)
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.unkeyedContainer()
+        func r(_ v: Double) -> Double { (v * 10000).rounded() / 10000 }
+        try c.encode(r(start)); try c.encode(r(end)); try c.encode(pitch); try c.encode(r(velocity))
     }
 }
 
@@ -193,6 +204,53 @@ final class Backend {
         struct R: Decodable { let notes: [MidiNote] }
         let (data, _) = try await URLSession.shared.data(from: base_.appendingPathComponent("api/songs/\(songID)/midi/\(stem).json"))
         return try JSONDecoder().decode(R.self, from: data).notes
+    }
+
+    struct NotesDetail: Decodable {
+        let notes: [MidiNote]
+        let tempo: Double
+        let edited: Bool?
+        /// The AI's notes when they were edited since.
+        let ai: [MidiNote]?
+        let from: String?
+    }
+
+    func midiDetail(_ songID: String, stem: String) async throws -> NotesDetail {
+        let (data, _) = try await URLSession.shared.data(from: base_.appendingPathComponent("api/songs/\(songID)/midi/\(stem).json"))
+        return try JSONDecoder().decode(NotesDetail.self, from: data)
+    }
+
+    struct NotesFile: Decodable {
+        struct Track: Decodable { let name: String; let drum: Bool; let notes: [MidiNote] }
+        let tracks: [Track]
+        let tempo: Double
+        let name: String
+    }
+
+    /// Reads the notes of a MIDI / OpenUtau (.ustx) / UTAU (.ust) file without saving anything.
+    func readNotesFile(_ file: URL) async throws -> NotesFile {
+        let data = try await post("api/notes-file", [URLQueryItem(name: "path", value: file.path)])
+        return try JSONDecoder().decode(NotesFile.self, from: data)
+    }
+
+    /// Saves edited notes and re-plays the MIDI track (creates it when the stem has none yet).
+    func saveNotes(_ songID: String, stem: String, notes: [MidiNote], tempo: Double?, origin: String?) async throws -> Song {
+        let json = String(data: try JSONEncoder().encode(notes), encoding: .utf8) ?? "[]"
+        var items = [URLQueryItem(name: "notes", value: json)]
+        if let tempo { items.append(URLQueryItem(name: "tempo", value: String(tempo))) }
+        if let origin { items.append(URLQueryItem(name: "origin", value: origin)) }
+        return try JSONDecoder().decode(Song.self, from: try await post("api/songs/\(songID)/midi/\(stem)/notes", items))
+    }
+
+    /// Throws away edits and goes back to the notes the AI read (or the first import).
+    func resetNotes(_ songID: String, stem: String) async throws -> Song {
+        try JSONDecoder().decode(Song.self, from: try await post("api/songs/\(songID)/midi/\(stem)/reset", []))
+    }
+
+    /// The song's tempo, measured once (for the beat lines of a blank score).
+    func tempo(_ songID: String) async throws -> Double {
+        let (data, _) = try await URLSession.shared.data(from: base_.appendingPathComponent("api/songs/\(songID)/tempo"))
+        return ((try JSONSerialization.jsonObject(with: data)) as? [String: Any])?["tempo"] as? Double ?? 120
     }
 
     func removeUserTrack(_ songID: String, stem: String) async throws -> Song {

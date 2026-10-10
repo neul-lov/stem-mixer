@@ -275,6 +275,9 @@ final class AppModel: ObservableObject {
     // MARK: Library
 
     func open(_ id: String) {
+        if editor != nil, song?.id != id {
+            guard closeEditor() else { return }
+        }
         guard let meta = songs.first(where: { $0.id == id }) else {
             Task {
                 if let meta = try? await backend.song(id) { load(meta) }
@@ -698,8 +701,17 @@ final class AppModel: ObservableObject {
     @Published var rollStem: String?
     @Published var rollNotes: [MidiNote] = []
 
-    func transcribe(_ stem: String, sound: String) {
+    func transcribe(_ stem: String, sound: String, thenEdit: Bool = false) {
         guard let song, server == .ready, job == nil else { return }
+        if song.midi(for: stem)?.edited == true {
+            let alert = NSAlert()
+            alert.messageText = "음정을 다시 뽑을까요?"
+            alert.informativeText = "직접 고치거나 가져온 \(StemInfo.of(stem).label) 음표가 AI가 새로 뽑은 음표로 바뀌어요."
+            alert.addButton(withTitle: "다시 뽑기")
+            alert.addButton(withTitle: "취소")
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+        }
+        if editor?.stem == stem { finishEditing() }
         let id = song.id
         jobError = nil
         withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
@@ -722,7 +734,7 @@ final class AppModel: ObservableObject {
                     reload(meta)
                     tracks["\(stem)_midi"] = TrackState()
                     applyGains()
-                    openRoll("\(stem)_midi")
+                    if thenEdit { editNotes(stem) } else { openRoll("\(stem)_midi") }
                 }
                 show("\(StemInfo.of(stem).label) 음정을 뽑았어요 (음표 \(meta.midi(for: stem)?.notes ?? 0)개)")
             } catch {
@@ -806,6 +818,229 @@ final class AppModel: ObservableObject {
         guard let url = namedMidi(stem) else { return }
         putOnPasteboard([url])
         show("MIDI 파일을 복사했어요")
+    }
+
+    // MARK: Note editor
+
+    /// The open note editor (shown in place of the mixer).
+    @Published var editor: NoteEditor?
+    /// Solo switches from before the editor changed them for "들을 소리".
+    private var soloBeforeEditing: [String: Bool] = [:]
+
+    /// Opens the note editor for a stem: its MIDI notes, or a blank score when it has none yet.
+    func editNotes(_ stem: String, then: ((NoteEditor) -> Void)? = nil) {
+        guard let song else { return }
+        if let ed = editor {
+            if ed.stem == stem {
+                then?(ed)
+                return
+            }
+            guard closeEditor() else { return }
+        }
+        busyStem = song.midi(for: stem)?.id ?? stem
+        Task {
+            defer { busyStem = nil }
+            let ed: NoteEditor
+            do {
+                if let midi = song.midi(for: stem) {
+                    let d = try await backend.midiDetail(song.id, stem: stem)
+                    ed = NoteEditor(stem: stem, tempo: midi.tempo ?? d.tempo, notes: d.notes, ghost: d.ai ?? d.notes,
+                                    exists: true, duration: song.duration)
+                    ed.origin = d.from
+                } else {
+                    let tempo = (try? await backend.tempo(song.id)) ?? 120
+                    ed = NoteEditor(stem: stem, tempo: tempo, notes: [], ghost: [], exists: false, duration: song.duration)
+                }
+            } catch {
+                show("음표를 열지 못했어요", success: false)
+                return
+            }
+            guard self.song?.id == song.id else { return }
+            leaveTextField()
+            soloBeforeEditing = tracks.mapValues(\.solo)
+            withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) { editor = ed }
+            setEditorListen(.both)
+            then?(ed)
+        }
+    }
+
+    /// Which tracks you hear while editing, by switching solos (put back when the editor closes).
+    func setEditorListen(_ listen: NoteEditor.Listen) {
+        guard let ed = editor else { return }
+        ed.listen = listen
+        let midi = "\(ed.stem)_midi"
+        for name in Array(tracks.keys) {
+            switch listen {
+            case .all: tracks[name]?.solo = soloBeforeEditing[name] ?? false
+            case .source: tracks[name]?.solo = name == ed.stem
+            case .notes: tracks[name]?.solo = name == midi
+            case .both: tracks[name]?.solo = name == ed.stem || name == midi
+            }
+        }
+        applyGains()
+    }
+
+    /// Saves the notes and re-plays the MIDI track, so you hear the edit.
+    func applyEditor(close: Bool) {
+        guard let song, let ed = editor, !ed.saving else { return }
+        if !ed.dirty, ed.exists || ed.notes.isEmpty {
+            if close { finishEditing() }
+            return
+        }
+        ed.saving = true
+        let stem = ed.stem
+        Task {
+            do {
+                let meta = try await backend.saveNotes(song.id, stem: stem, notes: ed.midiNotes,
+                                                       tempo: ed.exists ? nil : ed.tempo, origin: ed.origin)
+                ed.exists = true
+                ed.dirty = false
+                ed.saving = false
+                if self.song?.id == meta.id {
+                    reload(meta)
+                    if editor === ed { setEditorListen(ed.listen) }
+                    if rollStem == "\(stem)_midi" { rollNotes = ed.midiNotes }
+                }
+                show(close ? "음표를 적용했어요" : "적용했어요 · 음표 \(ed.notes.count)개")
+                if close, editor === ed { finishEditing() }
+            } catch {
+                ed.saving = false
+                show(error.localizedDescription, success: false)
+            }
+        }
+    }
+
+    /// Closes the editor, asking first when there are edits that weren't applied.
+    /// Returns false when it stays open (cancelled, or closing after applying).
+    @discardableResult
+    func closeEditor() -> Bool {
+        guard let ed = editor else { return true }
+        if ed.dirty {
+            let alert = NSAlert()
+            alert.messageText = "고친 음표를 적용할까요?"
+            alert.informativeText = "적용하지 않으면 이번에 고친 \(StemInfo.of(ed.stem).label) 음표가 사라져요."
+            alert.addButton(withTitle: "적용하고 닫기")
+            alert.addButton(withTitle: "버리기")
+            alert.addButton(withTitle: "취소")
+            alert.buttons[1].hasDestructiveAction = true
+            switch alert.runModal() {
+            case .alertFirstButtonReturn:
+                applyEditor(close: true)
+                return false
+            case .alertSecondButtonReturn:
+                break
+            default:
+                return false
+            }
+        }
+        finishEditing()
+        return true
+    }
+
+    func finishEditing() {
+        guard let ed = editor else { return }
+        ed.preview.stop()
+        for name in Array(tracks.keys) { tracks[name]?.solo = soloBeforeEditing[name] ?? false }
+        applyGains()
+        withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) { editor = nil }
+    }
+
+    func resetEditorNotes() {
+        guard let song, let ed = editor else { return }
+        let alert = NSAlert()
+        alert.messageText = "AI가 뽑은 음표로 되돌릴까요?"
+        alert.informativeText = "직접 고치거나 가져온 \(StemInfo.of(ed.stem).label) 음표가 사라져요."
+        alert.addButton(withTitle: "되돌리기")
+        alert.addButton(withTitle: "취소")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        ed.saving = true
+        Task {
+            do {
+                let meta = try await backend.resetNotes(song.id, stem: ed.stem)
+                let d = try await backend.midiDetail(song.id, stem: ed.stem)
+                reload(meta)
+                ed.setNotes(d.notes, add: false)
+                ed.selection = []
+                ed.dirty = false
+                ed.origin = nil
+                if editor === ed { setEditorListen(ed.listen) }
+                show("AI가 뽑은 음표로 되돌렸어요")
+            } catch {
+                show(error.localizedDescription, success: false)
+            }
+            ed.saving = false
+        }
+    }
+
+    static let noteFileTypes: [UTType] = [.midi] + ["mid", "midi", "ustx", "ust"].compactMap { UTType(filenameExtension: $0) }
+
+    static func isNoteFile(_ url: URL) -> Bool {
+        ["mid", "midi", "smf", "kar", "ustx", "ust"].contains(url.pathExtension.lowercased())
+    }
+
+    /// Picks a MIDI / OpenUtau / UTAU file and opens its notes in the editor for this stem.
+    func importNotes(for stem: String) {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = Self.noteFileTypes
+        panel.message = "\(StemInfo.of(stem).label) 음표로 가져올 MIDI(.mid) · OpenUtau(.ustx) · UTAU(.ust) 파일을 고르세요"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        importNotesFile(url, stem: stem)
+    }
+
+    /// Reads the file's notes and puts them in the editor (replacing or adding to what's there).
+    /// Nothing is saved until you press 적용 / 완료. Time 0 in the file = the start of the song.
+    func importNotesFile(_ url: URL, stem: String) {
+        guard song != nil else { return }
+        Task {
+            do {
+                let file = try await backend.readNotesFile(url)
+                guard let notes = pickTrack(file) else { return }
+                editNotes(stem) { ed in
+                    var add = false
+                    if !ed.notes.isEmpty {
+                        let alert = NSAlert()
+                        alert.messageText = "가져온 음표를 어떻게 넣을까요?"
+                        alert.informativeText = "지금 음표 \(ed.notes.count)개가 있어요. \(file.name)의 음표 \(notes.count)개로 바꾸거나, 지금 음표에 더할 수 있어요. 적용하기 전까지는 저장되지 않아요."
+                        alert.addButton(withTitle: "바꾸기")
+                        alert.addButton(withTitle: "더하기")
+                        alert.addButton(withTitle: "취소")
+                        switch alert.runModal() {
+                        case .alertFirstButtonReturn: add = false
+                        case .alertSecondButtonReturn: add = true
+                        default: return
+                        }
+                    } else if !ed.exists {
+                        ed.tempo = file.tempo
+                    }
+                    ed.origin = file.name
+                    ed.setNotes(notes, add: add)
+                    self.show("\(file.name)에서 음표 \(notes.count)개를 불러왔어요 · 확인하고 적용하세요")
+                }
+            } catch {
+                show(error.localizedDescription, success: false)
+            }
+        }
+    }
+
+    /// A file with several tracks (a band MIDI file): ask which one to use.
+    private func pickTrack(_ file: Backend.NotesFile) -> [MidiNote]? {
+        let tracks = file.tracks.filter { !$0.drum } + file.tracks.filter(\.drum)
+        if tracks.count == 1 { return tracks[0].notes }
+        let alert = NSAlert()
+        alert.messageText = "어느 트랙을 가져올까요?"
+        alert.informativeText = "\(file.name)에 음표가 있는 트랙이 \(tracks.count)개 있어요."
+        let popup = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 300, height: 26), pullsDown: false)
+        for (i, t) in tracks.enumerated() {
+            popup.addItem(withTitle: "\(i + 1). \(t.name)\(t.drum ? " (드럼)" : "") · 음표 \(t.notes.count)개")
+        }
+        popup.addItem(withTitle: "모든 트랙 합치기 (드럼 빼고)")
+        alert.accessoryView = popup
+        alert.addButton(withTitle: "가져오기")
+        alert.addButton(withTitle: "취소")
+        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+        let i = popup.indexOfSelectedItem
+        if i < tracks.count { return tracks[i].notes }
+        return tracks.filter { !$0.drum }.flatMap(\.notes).sorted { $0.start < $1.start }
     }
 
     // MARK: Sending tracks to other apps
@@ -979,6 +1214,9 @@ final class AppModel: ObservableObject {
         if typing, event.keyCode == UInt16(kVK_Escape) {
             leaveTextField(window)
             return true
+        }
+        if let ed = editor, !typing, recordingStem == nil, window?.attachedSheet == nil {
+            return handleEditorKey(event, ed)
         }
         if flags == .command, event.keyCode == UInt16(kVK_ANSI_C), !typing, song != nil {
             copyMix()

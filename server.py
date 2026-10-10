@@ -774,7 +774,111 @@ def midi_notes(song_id: str, stem: str):
     if not p.exists():
         raise HTTPException(404)
     d = json.loads(p.read_text())
-    return {"notes": d.get("notes", d["raw"]), "tempo": d["tempo"]}
+    return {"notes": d.get("notes", d["raw"]), "tempo": d["tempo"], "edited": "edited" in d,
+            "ai": d["raw"] if "edited" in d and not d.get("imported") else None, "from": d.get("from")}
+
+
+# ---------------------------------------------------------------- 음표 편집 · 가져오기
+@app.post("/api/notes-file")
+def notes_file(path: str = Form(...)):
+    """MIDI · OpenUtau · UTAU 파일의 음표를 읽기만 한다 (편집기에 불러온 뒤 '적용'해야 저장)."""
+    import transcribe as tr
+
+    f = Path(path).expanduser()
+    if not f.is_file():
+        raise HTTPException(400, "파일을 찾지 못했어요")
+    try:
+        out = tr.read_notes_file(f)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(400, f"이 파일을 읽지 못했어요 ({type(e).__name__})")
+    if not out["tracks"]:
+        raise HTTPException(400, "이 파일에는 음표가 없어요")
+    return {**out, "name": f.name}
+
+
+@app.get("/api/songs/{song_id}/tempo")
+def song_tempo(song_id: str):
+    """곡 빠르기 (음정을 아직 안 뽑은 트랙에 빈 악보로 시작할 때 박자선용). 한 번 재면 meta에 기억."""
+    import transcribe as tr
+
+    folder = song_folder(song_id)
+    meta = json.loads((folder / "meta.json").read_text())
+    if not meta.get("tempo"):
+        mix = sum(sf.read(folder / f"{n}.wav", dtype="float32", always_2d=True)[0] for n in meta["stems"])
+        meta["tempo"] = round(tr.detect_tempo(mix), 2)
+        (folder / "meta.json").write_text(json.dumps(meta, ensure_ascii=False))
+    return {"tempo": meta["tempo"]}
+
+
+@app.post("/api/songs/{song_id}/midi/{stem}/notes")
+def save_notes(song_id: str, stem: str, notes: str = Form(...), tempo: float = Form(None),
+               sound: str = Form(None), origin: str = Form(None)):
+    """편집기에서 고친 음표를 저장하고 음정 트랙을 다시 연주. 음정 트랙이 없으면 새로 만든다 (빈 악보 · 가져온 파일).
+    보이는 그대로 들리도록 조옮김 · 키 맞추기는 음표에 이미 들어 있는 것으로 보고 0으로 돌린다."""
+    import transcribe as tr
+
+    folder = song_folder(song_id)
+    meta = json.loads((folder / "meta.json").read_text())
+    if stem not in meta["stems"]:
+        raise HTTPException(400, "그 트랙이 없어요")
+    try:
+        clean = tr.clean_input(json.loads(notes))
+    except Exception:
+        raise HTTPException(400, "음표를 읽지 못했어요")
+    (folder / "midi").mkdir(exist_ok=True)
+    p = folder / "midi" / f"{stem}.json"
+    data = json.loads(p.read_text()) if p.exists() else None
+    if data is None:  # AI로 뽑은 적 없는 트랙: 이 음표가 곧 원본
+        if not tempo and not meta.get("tempo"):
+            mix = sum(sf.read(folder / f"{n}.wav", dtype="float32", always_2d=True)[0] for n in meta["stems"])
+            meta["tempo"] = round(tr.detect_tempo(mix), 2)
+        data = {"raw": clean, "imported": True, "tempo": float(tempo or meta["tempo"])}
+    elif tempo:
+        data["tempo"] = float(tempo)
+    data["edited"] = clean
+    if origin:
+        data["from"] = origin
+    tonic, mode = tr.detect_key(clean) if clean else data.get("key", (0, "major"))
+    data["key"] = [tonic, mode]
+    p.write_text(json.dumps(data))
+    extras = meta.get("extras") or []
+    extra = next((x for x in extras if x["source"] == stem), None)
+    if not extra:
+        extra = {"id": f"{stem}_midi", "source": stem, "sound": "piano",
+                 "label": f"{MIDI_LABEL.get(stem, stem)} ({'가져옴' if origin else '내 음표'})"}
+        extras.append(extra)
+    if sound in tr.SOUNDS:
+        extra["sound"] = sound
+    extra.update(transpose=0, snap=False, edited=True, key=tr.key_name(tonic, mode), tempo=round(data["tempo"], 1))
+    extra["notes"] = tr.render(folder, stem, extra["sound"], 0, False)
+    meta["extras"] = extras
+    (folder / "meta.json").write_text(json.dumps(meta, ensure_ascii=False))
+    return meta
+
+
+@app.post("/api/songs/{song_id}/midi/{stem}/reset")
+def reset_notes(song_id: str, stem: str):
+    """고친 음표를 버리고 AI가 뽑은 (또는 처음 가져온) 음표로 되돌린다."""
+    import transcribe as tr
+
+    folder = song_folder(song_id)
+    meta = json.loads((folder / "meta.json").read_text())
+    extra = next((x for x in meta.get("extras") or [] if x["source"] == stem), None)
+    p = folder / "midi" / f"{stem}.json"
+    if not extra or not p.exists():
+        raise HTTPException(404, "음정 트랙이 없어요")
+    data = json.loads(p.read_text())
+    data.pop("edited", None)
+    tonic, mode = tr.detect_key(data["raw"])
+    data["key"] = [tonic, mode]
+    p.write_text(json.dumps(data))
+    extra.update(transpose=0, snap=False, edited=False, key=tr.key_name(tonic, mode))
+    extra["notes"] = tr.render(folder, stem, extra["sound"], 0, False)
+    (folder / "meta.json").write_text(json.dumps(meta, ensure_ascii=False))
+    return meta
 
 
 @app.delete("/api/songs/{song_id}/midi/{stem}")

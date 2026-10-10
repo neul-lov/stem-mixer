@@ -262,7 +262,8 @@ def render(folder, stem, sound, transpose, snap, tempo=None):
     data = json.loads((folder / "midi" / f"{stem}.json").read_text())
     if tempo:
         data["tempo"] = float(tempo)
-    notes = [tuple(n) for n in data["raw"]]
+    # 앱에서 고친 음표가 있으면 그걸로 (AI가 뽑은 raw는 "AI 음표로 되돌리기"용으로 남겨 둔다).
+    notes = [tuple(n) for n in (data["edited"] if "edited" in data else data["raw"])]
     tonic, mode = data["key"]
     if snap:
         notes = snap_to_key(notes, tonic, mode)
@@ -273,6 +274,112 @@ def render(folder, stem, sound, transpose, snap, tempo=None):
     data["notes"] = notes
     (folder / "midi" / f"{stem}.json").write_text(json.dumps(data))
     return len(notes)
+
+
+# ---------------------------------------------------------------- 다른 곳에서 만든 음표 가져오기
+def clean_input(notes):
+    """편집기 · 파일에서 온 음표를 (시작초, 끝초, MIDI 음, 세기) 목록으로 정리."""
+    out = []
+    for n in notes:
+        s, e, p, v = float(n[0]), float(n[1]), int(round(float(n[2]))), float(n[3]) if len(n) > 3 else 0.8
+        if e - s >= 0.01 and 0 <= p <= 127 and e > 0:
+            out.append((round(max(0.0, s), 4), round(e, 4), p, float(np.clip(v, 0.05, 1.0))))
+    return sorted(out)
+
+
+def _midi_tracks(path):
+    import pretty_midi
+
+    pm = pretty_midi.PrettyMIDI(str(path))
+    _, tempi = pm.get_tempo_changes()
+    tracks = []
+    for i, inst in enumerate(pm.instruments):
+        if not inst.notes:
+            continue
+        name = inst.name.strip() or ("드럼" if inst.is_drum else pretty_midi.program_to_instrument_name(inst.program))
+        notes = [(n.start, n.end, n.pitch, (n.velocity - 30) / 90) for n in inst.notes]
+        tracks.append({"name": name or f"트랙 {i + 1}", "drum": bool(inst.is_drum), "notes": clean_input(notes)})
+    return tracks, float(tempi[0]) if len(tempi) else 120.0
+
+
+def _tick_to_sec(tempos):
+    """[(틱, BPM)] 템포 지도 → 틱을 초로 바꾸는 함수."""
+    tempos = sorted(tempos) or [(0, 120.0)]
+    if tempos[0][0] > 0:
+        tempos.insert(0, (0, tempos[0][1]))
+    marks, sec = [], 0.0
+    for i, (tick, bpm) in enumerate(tempos):
+        if i:
+            sec += (tick - tempos[i - 1][0]) / TICKS * 60 / tempos[i - 1][1]
+        marks.append((tick, sec, bpm))
+
+    def conv(tick):
+        t0, s0, bpm = next(m for m in reversed(marks) if m[0] <= tick) if tick >= 0 else marks[0]
+        return s0 + (tick - t0) / TICKS * 60 / bpm
+    return conv
+
+
+def _ustx_tracks(path):
+    import yaml
+
+    proj = yaml.safe_load(Path(path).read_text(encoding="utf-8-sig")) or {}
+    tempos = [(int(t.get("position", 0)), float(t["bpm"])) for t in proj.get("tempos") or []] or [(0, float(proj.get("bpm", 120)))]
+    conv = _tick_to_sec(tempos)
+    names = [t.get("track_name") or f"트랙 {i + 1}" for i, t in enumerate(proj.get("tracks") or [])]
+    by_track = {}
+    for part in proj.get("voice_parts") or []:
+        off = int(part.get("position", 0))
+        for n in part.get("notes") or []:
+            a = off + int(n["position"])
+            by_track.setdefault(int(part.get("track_no", 0)), []).append(
+                (conv(a), conv(a + int(n["duration"])), int(n["tone"]), 0.8))
+    tracks = [{"name": names[k] if k < len(names) else f"트랙 {k + 1}", "drum": False, "notes": clean_input(v)}
+              for k, v in sorted(by_track.items())]
+    return tracks, tempos[0][1]
+
+
+def _ust_tracks(path):
+    raw = Path(path).read_bytes()
+    text = raw.decode("utf-8") if b"Charset=UTF-8" in raw[:400] else raw.decode("shift_jis", errors="replace")
+    sections, cur = [], None
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("[#"):
+            cur = {"_": line}
+            sections.append(cur)
+        elif cur is not None and "=" in line:
+            k, v = line.split("=", 1)
+            cur[k] = v
+    setting = next((s for s in sections if s["_"] == "[#SETTING]"), {})
+    bpm = float(setting.get("Tempo", "120").replace(",", ".") or 120)
+    first_bpm, tick, sec, notes = bpm, 0, 0.0, []
+    for s in sections:
+        if not s["_"][2:-1].isdigit():
+            continue
+        if s.get("Tempo"):
+            bpm = float(s["Tempo"].replace(",", "."))
+        length = int(float(s.get("Length", 0)))
+        dur = length / TICKS * 60 / bpm
+        lyric = s.get("Lyric", "R").strip()
+        if lyric not in ("R", "r", "") and s.get("NoteNum"):
+            notes.append((sec, sec + dur, int(s["NoteNum"]), 0.8))
+        tick += length
+        sec += dur
+    return [{"name": setting.get("ProjectName") or Path(path).stem, "drum": False, "notes": clean_input(notes)}], first_bpm
+
+
+def read_notes_file(path):
+    """MIDI(.mid) · OpenUtau(.ustx) · UTAU(.ust) 파일 → {"tracks": [{name, drum, notes}], "tempo"}. 시작 = 곡 0초."""
+    suffix = Path(path).suffix.lower()
+    if suffix in (".mid", ".midi", ".smf", ".kar"):
+        tracks, tempo = _midi_tracks(path)
+    elif suffix == ".ustx":
+        tracks, tempo = _ustx_tracks(path)
+    elif suffix == ".ust":
+        tracks, tempo = _ust_tracks(path)
+    else:
+        raise ValueError("MIDI(.mid), OpenUtau(.ustx), UTAU(.ust) 파일만 가져올 수 있어요")
+    return {"tracks": [t for t in tracks if t["notes"]], "tempo": round(tempo, 3)}
 
 
 # ---------------------------------------------------------------- OpenUtau / UTAU로 내보내기
