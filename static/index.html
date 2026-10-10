@@ -101,8 +101,8 @@
     <div id="drop" class="drop">또는 여기에 음악 파일을 끌어다 놓거나 <u>눌러서 선택</u> (mp3, wav, m4a 등)</div>
     <input id="file" type="file" accept="audio/*,video/*" hidden>
     <div class="seg" id="mode">
-      <button type="button" data-mode="hq" class="on">고음질</button>
-      <button type="button" data-mode="hq6">6트랙 (기타·피아노)</button>
+      <button type="button" data-mode="hq" class="on">고음질 4트랙</button>
+      <button type="button" data-mode="hq6">고음질 6트랙 (기타·피아노)</button>
       <button type="button" data-mode="ai">빠르게</button>
     </div>
     <div class="hint" id="modeHint">AI가 악기 소리를 학습해서 깔끔하게 나눠요. 한 곡에 1~5분 정도 걸려요.</div>
@@ -169,7 +169,7 @@ const store = {
 let mode = ["hq", "hq6", "ai"].includes(store.get("mode")) ? store.get("mode") : "hq";
 const HINTS = {
   hq: "보컬은 RoFormer, 악기는 Demucs로 가장 깨끗하게 나눠요. 4분 곡에 약 3분.",
-  hq6: "같은 방식으로 기타·피아노까지 6개로 나눠요. 4분 곡에 약 2분.",
+  hq6: "같은 방식으로 기타·피아노까지 6개로 나눠요. 4분 곡에 약 3분.",
   ai: "Demucs만 써서 빨라요 (4분 곡에 약 20초). 보컬이 조금 덜 깨끗해요.",
 };
 function setMode(m) {
@@ -409,11 +409,11 @@ async function loadLibrary() {
   $("lib").innerHTML = "";
   for (const s of songs) {
     const el = document.createElement("div"); el.className = "lib-item";
-    el.innerHTML = `<span class="name"></span><span class="tag">${{ hq: "고음질", hq6: "6트랙", ai: "빠르게", ai6: "6트랙 (이전)", eq: "필터 (이전)" }[s.mode] || s.mode} · ${fmt(s.duration)}</span><button class="del">삭제</button>`;
+    el.innerHTML = `<span class="name"></span><span class="tag">${{ hq: "고음질 4트랙", hq6: "고음질 6트랙", ai: "빠르게", ai6: "6트랙 (이전)", eq: "필터 (이전)" }[s.mode] || s.mode} · ${fmt(s.duration)}</span><button class="del">삭제</button>`;
     el.querySelector(".name").textContent = s.title;
     // 다른 방식으로 다시 분리 (이미 있으면 그 버전을 연다)
     const key = s.id.slice(0, s.id.lastIndexOf("-"));
-    for (const [m, label] of [["hq", "고음질"], ["hq6", "6트랙"], ["ai", "빠르게"]]) {
+    for (const [m, label] of [["hq", "고음질 4트랙"], ["hq6", "고음질 6트랙"], ["ai", "빠르게"]]) {
       if (m === s.mode) continue;
       const btn = document.createElement("button");
       const exists = songs.some(o => o.id === `${key}-${m}`);

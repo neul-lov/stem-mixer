@@ -279,17 +279,17 @@ def roformer_vocals(x, job, p0, p1):
 
 
 def separate_hq(x, job, six=False):
-    """최고 품질: RoFormer로 보컬 → 나머지(원곡 - 보컬)를 Demucs로 악기별로.
-    나머지를 원곡에서 보컬을 뺀 값으로 잡아서 트랙을 다 더하면 원곡과 같다."""
-    vocals = roformer_vocals(x, job, 0.0, 0.6 if not six else 0.75)
+    """최고 품질: 보컬은 RoFormer, 반주(원곡 - 보컬)는 모델마다 잘하는 악기만 가져온다.
+    MUSDB18 테스트로 잰 결과 드럼은 htdemucs_6s, 베이스는 htdemucs_ft가 가장 좋았다.
+    나머지 악기 = 반주 - (가져온 악기들) 이라서 트랙을 다 더하면 원곡과 같다."""
+    vocals = roformer_vocals(x, job, 0.0, 0.5)
     inst = x - vocals
-    rest = demucs_split(inst, job, "htdemucs_6s" if six else "htdemucs_ft",
-                        0.6 if not six else 0.75, 1.0, "악기를 나누는 중")
-    out = {"vocals": vocals}
-    for name, y in rest.items():
-        if name != "vocals":
-            out[name] = y
-    out["other"] = out["other"] + rest["vocals"]  # 보컬 모델이 남긴 아주 작은 소리는 나머지 악기로
+    ft = demucs_split(inst, job, "htdemucs_ft", 0.5, 0.85, "베이스를 나누는 중")
+    s6 = demucs_split(inst, job, "htdemucs_6s", 0.85, 1.0, "드럼 · 기타 · 피아노를 나누는 중")
+    out = {"vocals": vocals, "drums": s6["drums"], "bass": ft["bass"]}
+    if six:
+        out["guitar"], out["piano"] = s6["guitar"], s6["piano"]
+    out["other"] = inst - sum(out[k] for k in out if k != "vocals")
     return out
 
 
