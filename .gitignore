@@ -16,3 +16,4 @@ mac/build/
 mac/.build/
 *.log
 .DS_Store
+models/

@@ -124,7 +124,7 @@ struct Sidebar: View {
     private var settingsMenu: some View {
         Menu {
             Picker("분리 방식", selection: $model.mode) {
-                ForEach(SplitMode.allCases) { Text($0.title).tag($0) }
+                ForEach(SplitMode.picker) { Text($0.title).tag($0) }
             }
             Divider()
             Button("음악 파일 선택…") { model.chooseFile() }
@@ -199,7 +199,7 @@ struct Sidebar: View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 8) {
                 HStack(spacing: 2) {
-                    ForEach(SplitMode.allCases) { m in
+                    ForEach(SplitMode.picker) { m in
                         Button {
                             withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) { model.mode = m }
                         } label: {
@@ -368,7 +368,7 @@ struct ResplitItems: View {
     @ObservedObject var model: AppModel
 
     var body: some View {
-        ForEach(SplitMode.allCases.filter { $0.rawValue != item.mode }) { mode in
+        ForEach(SplitMode.picker.filter { $0.rawValue != item.mode }) { mode in
             Button(model.version(of: item, mode: mode) == nil ? "\(mode.title)으로 다시 분리" : "\(mode.title) 버전 열기") {
                 model.resplit(item, mode: mode)
             }

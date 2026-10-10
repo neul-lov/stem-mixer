@@ -48,6 +48,26 @@
 - 유튜브 다운로드가 갑자기 안 되면 앱을 다시 실행하세요. 실행할 때마다 yt-dlp를 최신으로 업데이트합니다.
 - 유튜브 음원은 개인 연습/감상 용도로만 쓰세요.
 
+## 분리 방식과 품질
+| 방식 | 하는 일 | 4분 곡 (Apple Silicon) |
+|---|---|---|
+| **고음질** (기본) | 보컬은 MelBand RoFormer, 나머지는 Demucs htdemucs_ft | 약 2~3분 |
+| **6트랙** | 보컬은 MelBand RoFormer, 나머지는 Demucs htdemucs_6s (기타·피아노 추가) | 약 2분 |
+| **빠르게** | Demucs htdemucs만 | 약 20초 |
+
+MUSDB18 테스트 곡 12개로 잰 점수 (SDR, dB, 높을수록 깨끗함):
+
+| | 보컬 | 드럼 | 베이스 | 나머지 | 평균 |
+|---|---|---|---|---|---|
+| 빠르게 (htdemucs) | 9.13 | 7.95 | 8.04 | 4.50 | 7.41 |
+| **고음질** | **12.02** | **8.26** | **8.60** | **5.49** | **8.59** |
+| 6트랙 이전 방식 (htdemucs_6s) | 9.36 | 8.58 | 7.03 | 4.22 | 7.30 |
+| **6트랙** | **12.02** | **9.37** | 7.19 | 4.74 | **8.33** |
+
+예전 "빠르게(주파수 필터)" 방식은 보컬에서 6kHz 이상을 잘라 버려서 먹먹했어요. 지금은 목록에 없고,
+그 방식으로 만든 예전 곡은 "다른 방식으로 분리"로 다시 나눌 수 있어요. 트랙은 24비트 wav로 저장해요.
+보컬 모델(약 900MB)은 처음 고음질로 나눌 때 `models/` 에 한 번 내려받아요.
+
 ## 사용 시 주의
 - 개인 연습·감상용으로 만든 도구예요. 본인이 권리를 가졌거나 사용 허락을 받은 음원에만 쓰세요.
   분리한 트랙을 다시 배포하거나 상업적으로 쓰면 저작권 침해가 될 수 있어요.
@@ -61,10 +81,12 @@
 ## 사용한 오픈소스
 | 이름 | 용도 | 라이선스 |
 |---|---|---|
-| [Demucs](https://github.com/facebookresearch/demucs) | AI 음원 분리 (모델은 처음 실행 때 내려받음) | MIT |
+| [Demucs](https://github.com/facebookresearch/demucs) | 악기 분리 (htdemucs, htdemucs_ft, htdemucs_6s, 처음 실행 때 내려받음) | MIT |
 | [yt-dlp](https://github.com/yt-dlp/yt-dlp) | 링크에서 오디오 받기 | Unlicense |
 | [PyTorch](https://pytorch.org) | AI 실행 | BSD-3-Clause |
 | [FastAPI](https://fastapi.tiangolo.com) | 로컬 서버 | MIT |
+| [python-audio-separator](https://github.com/nomadkaraoke/python-audio-separator) | RoFormer 모델 실행 | MIT |
+| [MelBand RoFormer 보컬 모델](https://github.com/KimberleyJensen/Mel-Band-Roformer-Vocal-Model) (Kimberley Jensen) | 보컬 분리 가중치 (처음 실행 때 내려받음, 저장소에 포함 안 됨) | 저장소에 명시된 라이선스 없음 — 상업적으로 쓰려면 확인 필요 |
 | [FFmpeg](https://ffmpeg.org) ([imageio-ffmpeg](https://github.com/imageio/imageio-ffmpeg)) | 오디오 변환 (설치할 때 내려받음, 저장소에 포함 안 됨) | LGPL/GPL |
 
 ## 라이선스

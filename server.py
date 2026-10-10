@@ -33,7 +33,8 @@ FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()  # ffmpeg 따로 설치할 필요 없�
 SR = 44100
 STEMS = ["vocals", "bass", "drums", "other"]
 STEMS_6 = ["vocals", "bass", "drums", "guitar", "piano", "other"]  # ai6 모드 (기타·피아노 추가)
-MODELS = {"ai": "htdemucs", "ai6": "htdemucs_6s"}
+MODELS = {"ai": "htdemucs", "ai6": "htdemucs_6s"}  # 빠른 AI (Demucs만)
+MODES = ("hq", "hq6", "ai", "ai6", "eq")  # hq/hq6 = 최고 품질 (RoFormer 보컬 + Demucs)
 
 app = FastAPI()
 jobs = {}  # job_id -> {"status", "step", "progress", "song_id", "error"}
@@ -167,42 +168,129 @@ def download(url, dest, job):
 
 def decode(path):
     """어떤 포맷이든 44.1kHz 스테레오 float 배열로."""
-    cmd = [FFMPEG, "-v", "error", "-i", str(path), "-f", "f32le", "-ac", "2", "-ar", str(SR), "-"]
+    # 유튜브 음원은 48kHz라 바꿔야 한다. 정밀한 리샘플러 설정으로 고음이 깎이지 않게.
+    cmd = [FFMPEG, "-v", "error", "-i", str(path), "-af",
+           f"aresample={SR}:filter_size=128:phase_shift=10:cutoff=0.99",
+           "-f", "f32le", "-ac", "2", "-ar", str(SR), "-"]
     raw = subprocess.run(cmd, check=True, capture_output=True).stdout
     return np.frombuffer(raw, dtype=np.float32).reshape(-1, 2)
 
 
 # ---------------------------------------------------------------- 분리
-def separate_ai(x, job, mode="ai"):
+DEVICE = None
+
+
+def _device():
+    global DEVICE
+    if DEVICE is None:
+        import torch
+        DEVICE = "cuda" if torch.cuda.is_available() else (
+            "mps" if torch.backends.mps.is_available() else "cpu")
+    return DEVICE
+
+
+def demucs_split(x, job, model_name, p0=0.0, p1=1.0, step="AI가 악기를 나누는 중"):
+    """Demucs로 나누기. 진행률은 p0~p1 구간에 표시."""
     import torch
     from demucs.apply import apply_model
     from demucs.pretrained import get_model
 
-    if mode not in _models:
-        job["step"] = "AI 모델 준비 중 (처음 한 번만 다운로드)"
-        _models[mode] = get_model(MODELS[mode])
-        _models[mode].eval()
-    _model = _models[mode]
-    device = "cuda" if torch.cuda.is_available() else (
-        "mps" if torch.backends.mps.is_available() else "cpu")
-    job["step"] = "AI가 악기를 나누는 중"
-    job["progress"] = 0.0
-    wav = torch.from_numpy(x.T.copy())
+    if model_name not in _models:
+        job["step"] = "AI 모델 불러오는 중 (처음 한 번은 다운로드)"
+        _models[model_name] = get_model(model_name)
+        _models[model_name].eval()
+    model = _models[model_name]
+    job["step"] = step
+    job["progress"] = p0
+    wav = torch.from_numpy(x.T.copy()).float()
     ref = wav.mean(0)
     mean, std = ref.mean(), ref.std() + 1e-8
     total = wav.shape[-1]
+    # get_model gives a BagOfModels; htdemucs_ft runs four models one after another.
+    inner = getattr(model, "models", [model])
+    seg = int(float(getattr(model, "segment", None) or inner[0].segment) * SR)
 
     def cb(d):
         if d.get("state") == "end":
-            # get_model gives a BagOfModels; the segment length lives on the models inside it.
-            seg = int(float(getattr(_model, "segment", None) or _model.models[0].segment) * SR)
-            job["progress"] = min(0.99, (d["segment_offset"] + seg) / total)
+            done = (d.get("model_idx_in_bag", 0) + min(1, (d["segment_offset"] + seg) / total)) / len(inner)
+            job["progress"] = p0 + (p1 - p0) * min(0.99, done)
 
     with torch.no_grad():
-        out = apply_model(_model, ((wav - mean) / std)[None], device=device,
+        out = apply_model(model, ((wav - mean) / std)[None], device=_device(),
                           split=True, overlap=0.25, callback=cb)[0]
     out = (out * std + mean).cpu().numpy()
-    return {name: out[i].T for i, name in enumerate(_model.sources)}
+    return {name: out[i].T for i, name in enumerate(model.sources)}
+
+
+def separate_ai(x, job, mode="ai"):
+    return demucs_split(x, job, MODELS[mode])
+
+
+VOCAL_MODEL = "vocals_mel_band_roformer.ckpt"  # MelBand RoFormer (Kimberley Jensen)
+MODEL_DIR = ROOT / "models"
+_vocal_sep = None
+
+
+def roformer_vocals(x, job, p0, p1):
+    """보컬만 RoFormer로 뽑는다. 보컬 품질이 Demucs보다 훨씬 좋다 (덜 먹먹함)."""
+    global _vocal_sep
+    import logging
+    import tempfile
+    import time
+    from audio_separator.separator import Separator
+
+    tmp = Path(tempfile.mkdtemp(prefix="stem-", dir=LIBRARY))
+    try:
+        if _vocal_sep is None:
+            job["step"] = ("보컬 AI 모델 불러오는 중" if (MODEL_DIR / VOCAL_MODEL).exists()
+                           else "보컬 AI 모델 받는 중 (처음 한 번만 약 900MB)")
+            _vocal_sep = Separator(output_dir=str(tmp), model_file_dir=str(MODEL_DIR),
+                                   log_level=logging.WARNING, output_format="WAV")
+            _vocal_sep.load_model(model_filename=VOCAL_MODEL)
+        sep = _vocal_sep
+        sep.output_dir = str(tmp)
+        if getattr(sep, "model_instance", None) is not None:
+            sep.model_instance.output_dir = str(tmp)
+        src = tmp / "in.wav"
+        sf.write(src, x, SR, subtype="FLOAT")
+        job["step"] = "보컬을 고음질로 뽑는 중"
+        # The separator has no progress callback; estimate from the song length (about 0.4 s per second).
+        expected, t0, stop = max(10.0, len(x) / SR * 0.4), time.time(), threading.Event()
+
+        def tick():
+            while not stop.wait(0.5):
+                job["progress"] = p0 + (p1 - p0) * min(0.95, (time.time() - t0) / expected)
+
+        threading.Thread(target=tick, daemon=True).start()
+        try:
+            files = sep.separate(str(src))
+        finally:
+            stop.set()
+        path = next(f for f in files if "(vocals)" in f.lower())
+        path = path if Path(path).is_absolute() else tmp / path
+        vocals, _ = sf.read(path, dtype="float32", always_2d=True)
+        vocals = vocals[: len(x)]
+        if len(vocals) < len(x):
+            vocals = np.pad(vocals, ((0, len(x) - len(vocals)), (0, 0)))
+        job["progress"] = p1
+        return vocals
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def separate_hq(x, job, six=False):
+    """최고 품질: RoFormer로 보컬 → 나머지(원곡 - 보컬)를 Demucs로 악기별로.
+    나머지를 원곡에서 보컬을 뺀 값으로 잡아서 트랙을 다 더하면 원곡과 같다."""
+    vocals = roformer_vocals(x, job, 0.0, 0.6 if not six else 0.75)
+    inst = x - vocals
+    rest = demucs_split(inst, job, "htdemucs_6s" if six else "htdemucs_ft",
+                        0.6 if not six else 0.75, 1.0, "악기를 나누는 중")
+    out = {"vocals": vocals}
+    for name, y in rest.items():
+        if name != "vocals":
+            out[name] = y
+    out["other"] = out["other"] + rest["vocals"]  # 보컬 모델이 남긴 아주 작은 소리는 나머지 악기로
+    return out
 
 
 def _band(x, lo, hi):
@@ -285,13 +373,18 @@ def run_job(job_id, mode, text=None, upload_path=None, title=None, resplit=None)
                 shutil.move(upload_path, src)
             job.update(step="오디오 읽는 중", progress=0.0)
             x = decode(src)
-            stems = separate_ai(x, job, mode) if mode in MODELS else separate_eq(x, job)
-            names = STEMS_6 if mode == "ai6" else STEMS
+            if mode in ("hq", "hq6"):
+                stems = separate_hq(x, job, six=mode == "hq6")
+            elif mode in MODELS:
+                stems = separate_ai(x, job, mode)
+            else:
+                stems = separate_eq(x, job)
+            names = STEMS_6 if mode in ("ai6", "hq6") else STEMS
             job.update(step="저장 중", progress=0.99)
             peak = max(float(np.abs(s).max()) for s in stems.values())
             scale = 0.99 / peak if peak > 0.99 else 1.0
             for name in names:
-                sf.write(folder / f"{name}.wav", stems[name] * scale, SR, subtype="PCM_16")
+                sf.write(folder / f"{name}.wav", stems[name] * scale, SR, subtype="PCM_24")
             if not kept_source(key):  # 다음에 다른 방식으로 나눌 때 쓰도록 원본 보관
                 shutil.move(src, SOURCES / f"{key}{src.suffix.lower()}")
             src.unlink(missing_ok=True)
@@ -327,7 +420,7 @@ def run_job(job_id, mode, text=None, upload_path=None, title=None, resplit=None)
 @app.post("/api/jobs")
 async def create_job(mode: str = Form("ai"), url: str = Form(None), path: str = Form(None),
                      file: UploadFile = File(None)):
-    if mode not in ("ai", "ai6", "eq"):
+    if mode not in MODES:
         raise HTTPException(400, "mode")
     job_id = uuid.uuid4().hex
     jobs[job_id] = {"status": "running", "step": "대기 중", "progress": 0.0}
@@ -352,7 +445,7 @@ async def create_job(mode: str = Form("ai"), url: str = Form(None), path: str = 
 
 @app.post("/api/songs/{song_id}/resplit")
 def resplit_song(song_id: str, mode: str = Form(...)):
-    if mode not in ("ai", "ai6", "eq") or not (LIBRARY / song_id / "meta.json").exists():
+    if mode not in MODES or not (LIBRARY / song_id / "meta.json").exists():
         raise HTTPException(400, "다시 분리할 곡을 찾지 못했어요")
     job_id = uuid.uuid4().hex
     jobs[job_id] = {"status": "running", "step": "대기 중", "progress": 0.0}

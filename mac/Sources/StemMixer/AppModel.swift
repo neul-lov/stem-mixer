@@ -58,25 +58,41 @@ struct TrackState {
 }
 
 enum SplitMode: String, CaseIterable, Identifiable {
-    case ai, ai6, eq
+    /// hq / hq6: vocals by MelBand RoFormer, instruments by Demucs (best quality).
+    /// ai: Demucs only (fast). ai6 / eq: older modes, kept so earlier songs still show a label.
+    case hq, hq6, ai, ai6, eq
     var id: String { rawValue }
+
+    /// The modes offered for new separations.
+    static let picker: [SplitMode] = [.hq, .hq6, .ai]
+
     var title: String {
         switch self {
-        case .ai: "AI 4트랙"
-        case .ai6: "AI 6트랙"
-        case .eq: "빠르게"
+        case .hq: "고음질"
+        case .hq6: "6트랙"
+        case .ai: "빠르게"
+        case .ai6: "6트랙 (이전)"
+        case .eq: "필터 (이전)"
         }
     }
     var detail: String {
         switch self {
-        case .ai: "보컬 · 베이스 · 드럼 · 나머지 악기"
-        case .ai6: "보컬 · 베이스 · 드럼 · 기타 · 피아노 · 나머지"
-        case .eq: "몇 초면 끝나지만 소리가 섞여요"
+        case .hq: "보컬 · 베이스 · 드럼 · 나머지 악기 · 4분 곡에 약 3분"
+        case .hq6: "기타 · 피아노까지 6개 · 4분 곡에 약 2분"
+        case .ai: "보컬이 조금 덜 깨끗해요 · 4분 곡에 약 20초"
+        case .ai6: "기타 · 피아노까지 6개 (이전 방식)"
+        case .eq: "주파수로만 자른 이전 방식이라 먹먹해요"
         }
     }
 
     static func label(_ raw: String) -> String { SplitMode(rawValue: raw)?.title ?? raw }
-    static func icon(_ raw: String) -> String { raw == "eq" ? "bolt.fill" : "sparkles" }
+    static func icon(_ raw: String) -> String {
+        switch raw {
+        case "eq": "bolt.fill"
+        case "ai": "hare.fill"
+        default: "sparkles"
+        }
+    }
 }
 
 struct Job {
@@ -95,7 +111,8 @@ final class AppModel: ObservableObject {
     @Published var server: ServerState = .starting
     @Published var songs: [Song] = []
     @Published var input = ""
-    @Published var mode: SplitMode = SplitMode(rawValue: UserDefaults.standard.string(forKey: "mode") ?? "") ?? .ai {
+    @Published var mode: SplitMode = SplitMode(rawValue: UserDefaults.standard.string(forKey: "mode") ?? "")
+        .flatMap { SplitMode.picker.contains($0) ? $0 : nil } ?? .hq {
         didSet { UserDefaults.standard.set(mode.rawValue, forKey: "mode") }
     }
     @Published var job: Job?
