@@ -26,21 +26,24 @@ struct MidiTrack: Codable, Equatable, Identifiable {
     var edited: Bool?
 }
 
-/// [start, end, pitch, velocity] on the wire.
+/// [start, end, pitch, velocity] on the wire, plus the lyric when the note has one.
 struct MidiNote: Codable, Equatable {
     var start: Double, end: Double, pitch: Int, velocity: Double
-    init(start: Double, end: Double, pitch: Int, velocity: Double) {
-        self.start = start; self.end = end; self.pitch = pitch; self.velocity = velocity
+    var lyric: String?
+    init(start: Double, end: Double, pitch: Int, velocity: Double, lyric: String? = nil) {
+        self.start = start; self.end = end; self.pitch = pitch; self.velocity = velocity; self.lyric = lyric
     }
     init(from decoder: Decoder) throws {
         var c = try decoder.unkeyedContainer()
         start = try c.decode(Double.self); end = try c.decode(Double.self)
         pitch = try c.decode(Int.self); velocity = try c.decode(Double.self)
+        if !c.isAtEnd { lyric = try? c.decode(String.self) }
     }
     func encode(to encoder: Encoder) throws {
         var c = encoder.unkeyedContainer()
         func r(_ v: Double) -> Double { (v * 10000).rounded() / 10000 }
         try c.encode(r(start)); try c.encode(r(end)); try c.encode(pitch); try c.encode(r(velocity))
+        if let lyric, !lyric.isEmpty { try c.encode(lyric) }
     }
 }
 
@@ -85,6 +88,8 @@ struct JobStatus: Decodable {
     let progress: Double?
     let song_id: String?
     let error: String?
+    /// Bytes saved by the FLAC job.
+    let freed: Int64?
 }
 
 /// Runs the Python separation server (server.py) in the background and talks to it over HTTP.
@@ -105,11 +110,17 @@ final class Backend {
     var log: URL { folder.appendingPathComponent("server-app.log") }
 
     func stemURL(song: String, stem: String) -> URL {
-        library.appendingPathComponent(song).appendingPathComponent("\(stem).wav")
+        trackFile(library.appendingPathComponent(song), stem)
     }
 
     func userStemURL(song: String, stem: String) -> URL {
-        library.appendingPathComponent(song).appendingPathComponent("user/\(stem).wav")
+        trackFile(library.appendingPathComponent(song).appendingPathComponent("user"), stem)
+    }
+
+    /// Tracks are saved as FLAC (same sound, about half the size); songs from before are still wav.
+    private func trackFile(_ dir: URL, _ name: String) -> URL {
+        let flac = dir.appendingPathComponent("\(name).flac")
+        return FileManager.default.fileExists(atPath: flac.path) ? flac : dir.appendingPathComponent("\(name).wav")
     }
 
     /// The file that should play for a stem: the user's version when it's switched on.
@@ -253,6 +264,36 @@ final class Backend {
         return ((try JSONSerialization.jsonObject(with: data)) as? [String: Any])?["tempo"] as? Double ?? 120
     }
 
+    struct PitchCurve: Decodable {
+        let hop: Double
+        let midi: [Double?]
+    }
+
+    /// The pitch the original voice sings, every 10 ms (nil = silent). nil when it hasn't been read yet.
+    func pitchCurve(_ songID: String, stem: String) async throws -> PitchCurve? {
+        let (data, response) = try await URLSession.shared.data(from: base_.appendingPathComponent("api/songs/\(songID)/pitch/\(stem)"))
+        if (response as? HTTPURLResponse)?.statusCode == 404 { return nil }
+        return try JSONDecoder().decode(PitchCurve.self, from: data)
+    }
+
+    /// Starts reading the pitch line. Returns the job id.
+    func startPitch(_ songID: String, stem: String) async throws -> String {
+        let data = try await post("api/songs/\(songID)/pitch/\(stem)", [])
+        guard let id = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["job_id"] as? String else {
+            throw BackendError(message: "요청이 실패했어요")
+        }
+        return id
+    }
+
+    /// Converts the library's old wav tracks to FLAC. Returns the job id.
+    func compact() async throws -> String {
+        let data = try await post("api/compact", [])
+        guard let id = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["job_id"] as? String else {
+            throw BackendError(message: "요청이 실패했어요")
+        }
+        return id
+    }
+
     func removeUserTrack(_ songID: String, stem: String) async throws -> Song {
         var req = URLRequest(url: base_.appendingPathComponent("api/songs/\(songID)/user-track/\(stem)"))
         req.httpMethod = "DELETE"
@@ -346,7 +387,11 @@ final class Backend {
         return id
     }
 
-    struct Storage: Decodable { let songs: Int64; let sources: Int64; let leftovers: Int64; let models: Int64; let busy: Bool }
+    struct Storage: Decodable {
+        let songs: Int64; let sources: Int64; let leftovers: Int64; let models: Int64; let busy: Bool
+        /// Tracks still saved as wav (FLAC would make them about half).
+        let wav: Int64?
+    }
 
     func storage() async throws -> Storage {
         let (data, _) = try await URLSession.shared.data(from: base.appendingPathComponent("api/storage"))

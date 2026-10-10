@@ -557,6 +557,32 @@ struct StorageView: View {
                 .padding(12)
                 .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(Color.accentColor.opacity(0.08)))
                 .padding(.horizontal, 12)
+
+                if (s.wav ?? 0) > 0 || model.compacting != nil {
+                    HStack(spacing: 10) {
+                        Image(systemName: "arrow.down.right.and.arrow.up.left").foregroundStyle(Color.green)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(model.compacting.map { "\($0.step) · \(Int($0.progress * 100))%" }
+                                 ?? "예전 곡 트랙 \(AppModel.bytes(s.wav ?? 0)) → 약 절반으로")
+                                .font(.system(size: 12.5, weight: .semibold)).monospacedDigit()
+                            Text("소리 손실 없는 FLAC으로 바꿔요. 바꾼 뒤 샘플이 똑같은지 확인하고 원래 파일을 지워요. 새로 나누는 곡은 처음부터 FLAC이에요.")
+                                .font(.system(size: 10.5)).foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        Spacer()
+                        if model.compacting != nil {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Button("공간 줄이기") { model.compactLibrary() }
+                                .disabled(s.busy)
+                                .help(s.busy ? "분리 · 음정 뽑기가 끝나면 할 수 있어요" : "곡 수에 따라 몇 분 걸릴 수 있어요. 그동안 앱은 그대로 쓸 수 있어요")
+                        }
+                    }
+                    .padding(12)
+                    .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(Color.green.opacity(0.08)))
+                    .padding(.horizontal, 12)
+                    .padding(.top, 8)
+                }
             }
 
             HStack(spacing: 6) {

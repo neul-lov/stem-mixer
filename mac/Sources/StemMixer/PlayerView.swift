@@ -58,6 +58,7 @@ struct PlayerView: View {
                 KeyHint("Space", "재생")
                 KeyHint("← →", "5초")
                 KeyHint("1 2 3", "보컬·베이스·드럼만")
+                KeyHint("4 5", "기타·피아노만 (6트랙)")
                 KeyHint("0", "원곡")
             }
             .padding(.top, 10)
@@ -184,6 +185,7 @@ struct PlayerView: View {
                             .overlay(Capsule().strokeBorder(Color.accentColor.opacity(on ? 0.45 : 0), lineWidth: 1))
                     }
                     .buttonStyle(PressableStyle())
+                    .help(preset.key.map { "단축키 \($0)" } ?? "")
                 }
             }
         }
@@ -232,7 +234,8 @@ struct TrackRow: View {
         let state = model.tracks[name] ?? TrackState()
         let audible = model.audible(name)
         HStack(spacing: 14) {
-            FileDragSource(files: { model.song.flatMap { model.namedStem(name, of: $0) }.map { [$0] } ?? [] }) {
+            FileDragSource(files: { model.song.flatMap { model.namedStem(name, of: $0) }.map { [$0] } ?? [] },
+                           prepare: { model.prepareNamedStems([name]) }) {
                 Image(systemName: "line.3.horizontal")
                     .font(.system(size: 11, weight: .bold))
                     .foregroundStyle(.tertiary)
@@ -440,7 +443,8 @@ struct SendToApps: View {
         VStack(alignment: .leading, spacing: 8) {
             SectionTitle(title: "편집 앱으로 보내기", icon: "arrow.up.forward.app").padding(.horizontal, -10)
             HStack(spacing: 8) {
-                FileDragSource(files: { model.namedStems() }) {
+                FileDragSource(files: { model.namedStems() },
+                               prepare: { model.prepareNamedStems(model.song?.allTracks ?? []) }) {
                     chip(icon: "square.stack.3d.up.fill", title: "모든 트랙 끌어놓기", tint: .accentColor)
                 }
                 .help("편집 앱 타임라인에 끌어 놓으면 트랙이 한 번에 들어가요")

@@ -28,8 +28,8 @@ def _device():
 
 
 # ---------------------------------------------------------------- 한 음씩 (보컬, 베이스)
-def mono_notes(y, progress=lambda p: None, fmin=50.0, fmax=1100.0, decoder="argmax"):
-    """f0를 읽어서 (시작초, 끝초, MIDI 음, 세기 0~1) 목록으로."""
+def _track_pitch(y, progress, fmin, fmax, decoder):
+    """10ms마다 음 높이(MIDI, 소수점까지)와 소리가 나는지, 크기(dB)."""
     import torch
     import torchaudio
     import torchcrepe
@@ -82,6 +82,31 @@ def mono_notes(y, progress=lambda p: None, fmin=50.0, fmax=1100.0, decoder="argm
     voiced = (per > 0.45) & (db > max(-50, db.max() - 40))
     midi = 69 + 12 * np.log2(np.maximum(f0, 1e-3) / 440)
     midi = median_filter(midi, 5)
+    return midi, voiced, db, m, n, frame
+
+
+def curve_list(midi, voiced):
+    """편집 화면에 그릴 음높이 선: 10ms마다 MIDI 음 (소리가 없으면 None)."""
+    return [round(float(v), 2) if ok and math.isfinite(v) else None for v, ok in zip(midi, voiced)]
+
+
+def pitch_range(stem):
+    # CREPE covers about 32.7 Hz (C1) and up; asking for lower returns nothing.
+    return (33, 400) if stem == "bass" else (60, 1100)
+
+
+def pitch_curve(y, stem, progress=lambda p: None):
+    fmin, fmax = pitch_range(stem)
+    midi, voiced, *_ = _track_pitch(y, progress, fmin, fmax, "argmax")
+    progress(1.0)
+    return curve_list(midi, voiced)
+
+
+def mono_notes(y, progress=lambda p: None, fmin=50.0, fmax=1100.0, decoder="argmax", curve=None):
+    """f0를 읽어서 (시작초, 끝초, MIDI 음, 세기 0~1) 목록으로. curve(list)를 주면 음높이 선도 채운다."""
+    midi, voiced, db, m, n, frame = _track_pitch(y, progress, fmin, fmax, decoder)
+    if curve is not None:
+        curve[:] = curve_list(midi, voiced)
     q = np.where(voiced, np.round(midi), -1).astype(int)
     # Note starts from loudness jumps, so a repeated note at the same pitch is split in two.
     import librosa
@@ -163,7 +188,7 @@ def poly_notes(y, progress=lambda p: None, bass=False):
 # ---------------------------------------------------------------- 조성 · 빠르기
 def detect_key(notes):
     hist = np.zeros(12)
-    for s, e, p, _ in notes:
+    for s, e, p, *_ in notes:
         hist[p % 12] += e - s
     if hist.sum() == 0:
         return 0, "major"
@@ -184,10 +209,10 @@ def scale(tonic, mode):
 def snap_to_key(notes, tonic, mode):
     sc = scale(tonic, mode)
     out = []
-    for s, e, p, v in notes:
+    for s, e, p, v, *lyric in notes:
         if p % 12 not in sc:
             p = p - 1 if (p - 1) % 12 in sc else p + 1
-        out.append((s, e, p, v))
+        out.append((s, e, p, v, *lyric))
     return out
 
 
@@ -198,15 +223,60 @@ def detect_tempo(mix):
     return float(np.atleast_1d(tempo)[0]) or 120.0
 
 
+# ---------------------------------------------------------------- 가사
+# 음표는 (시작초, 끝초, MIDI 음, 세기) 또는 가사가 있으면 (…, 가사). 가사는 편집 화면에서 넣는다.
+def lyric_of(note):
+    return note[4] if len(note) > 4 and note[4] else None
+
+
+def _midi_text_out(text):
+    # MIDI 가사는 바이트로 저장된다. mido는 latin-1로만 쓰니 UTF-8 바이트를 그대로 넘긴다 (요즘 프로그램은 UTF-8로 읽음).
+    return text.encode("utf-8").decode("latin-1")
+
+
+def _midi_text_encoding(texts):
+    """MIDI 가사의 글자 인코딩을 파일 하나에 한 번 고른다. 옛 한국 노래방 파일(cp949)의 바이트 중에는
+    Shift-JIS로도 읽히는 것(반각 가타카나)이 있어서, 한 글자씩 고르면 한글과 가타카나가 섞인다."""
+    raws = [t.encode("latin-1", errors="ignore") for t in texts]
+
+    def decoded(enc):  # 가사 하나하나가 다 읽혀야 (이어 붙이면 두 가사의 바이트가 한 글자로 읽힐 수 있다)
+        try:
+            return "\n".join(r.decode(enc) for r in raws)
+        except UnicodeDecodeError:
+            return None
+    if decoded("utf-8") is not None:
+        return "utf-8"
+    kr, jp = decoded("cp949"), decoded("shift_jis")
+    if kr is not None and jp is not None:
+        hangul = any("\uac00" <= c <= "\ud7a3" for c in kr)
+        halfwidth = any("\uff61" <= c <= "\uff9f" for c in jp)
+        japanese = any("\u3040" <= c <= "\u30ff" or "\u4e00" <= c <= "\u9fff" for c in jp)
+        return "cp949" if hangul and (halfwidth or not japanese) else "shift_jis"
+    return "cp949" if kr is not None else "shift_jis" if jp is not None else None
+
+
+def _midi_text_in(text, enc=None):
+    raw = text.encode("latin-1", errors="ignore")
+    for e in ([enc] if enc else []) + ["utf-8", "shift_jis", "cp949"]:
+        try:
+            return raw.decode(e)
+        except UnicodeDecodeError:
+            pass
+    return text
+
+
 # ---------------------------------------------------------------- 저장 · 다시 연주
 def write_midi(notes, path, tempo, sound):
     import pretty_midi
 
     pm = pretty_midi.PrettyMIDI(initial_tempo=tempo)
     inst = pretty_midi.Instrument(program=GM_PROGRAM.get(sound, 0))
-    for s, e, p, v in notes:
+    for n in notes:
+        s, e, p, v = n[:4]
         if 0 <= p <= 127:
             inst.notes.append(pretty_midi.Note(velocity=int(30 + 90 * v), pitch=p, start=s, end=e))
+            if lyric_of(n):
+                pm.lyrics.append(pretty_midi.Lyric(_midi_text_out(lyric_of(n)), s))
     pm.instruments.append(inst)
     pm.write(str(path))
 
@@ -214,7 +284,7 @@ def write_midi(notes, path, tempo, sound):
 def synth(notes, n_frames, sound="piano"):
     """내장 신스로 음표를 연주한 스테레오 float 배열."""
     out = np.zeros(n_frames, np.float32)
-    for s, e, p, v in notes:
+    for s, e, p, v, *_ in notes:
         f = 440 * 2 ** ((p - 69) / 12)
         release = 0.25 if sound != "piano" else 0.4
         i0 = int(s * SR)
@@ -251,10 +321,10 @@ def synth(notes, n_frames, sound="piano"):
     return np.stack([out, out], axis=1)
 
 
-def transcribe(y, stem, progress=lambda p: None):
+def transcribe(y, stem, progress=lambda p: None, curve=None):
     if stem in MONO_STEMS:
-        # CREPE covers about 32.7 Hz (C1) and up; asking for lower returns nothing.
-        return mono_notes(y, progress, fmin=33 if stem == "bass" else 60, fmax=400 if stem == "bass" else 1100)
+        fmin, fmax = pitch_range(stem)
+        return mono_notes(y, progress, fmin=fmin, fmax=fmax, curve=curve)
     return poly_notes(y, progress, bass=False)
 
 
@@ -268,9 +338,10 @@ def render(folder, stem, sound, transpose, snap, tempo=None):
     tonic, mode = data["key"]
     if snap:
         notes = snap_to_key(notes, tonic, mode)
-    notes = [(s, e, p + transpose, v) for s, e, p, v in notes]
-    n_frames = sf.info(folder / f"{stem}.wav").frames
-    sf.write(folder / f"{stem}_midi.wav", synth(notes, n_frames, sound), SR, subtype="PCM_24")
+    notes = [(s, e, p + transpose, v, *lyric) for s, e, p, v, *lyric in notes]
+    import audiofile
+
+    audiofile.write(folder, f"{stem}_midi", synth(notes, audiofile.frames(folder, stem), sound))
     write_midi(notes, folder / "midi" / f"{stem}.mid", data["tempo"], sound)
     data["notes"] = notes
     (folder / "midi" / f"{stem}.json").write_text(json.dumps(data))
@@ -279,15 +350,16 @@ def render(folder, stem, sound, transpose, snap, tempo=None):
 
 # ---------------------------------------------------------------- 다른 곳에서 만든 음표 가져오기
 def clean_input(notes):
-    """편집기 · 파일에서 온 음표를 (시작초, 끝초, MIDI 음, 세기) 목록으로 정리."""
+    """편집기 · 파일에서 온 음표를 (시작초, 끝초, MIDI 음, 세기[, 가사]) 목록으로 정리."""
     out = []
     for n in notes:
-        s, e, v = float(n[0]), float(n[1]), float(n[3]) if len(n) > 3 else 0.8
+        s, e, v = float(n[0]), float(n[1]), float(n[3]) if len(n) > 3 and n[3] is not None else 0.8
         if not all(map(math.isfinite, (s, e, v, float(n[2])))):  # Infinity · NaN은 버린다
             continue
         p = int(round(float(n[2])))
+        lyric = " ".join(n[4].split())[:32] if len(n) > 4 and isinstance(n[4], str) else ""  # 줄바꿈 없이 한 줄
         if e - s >= 0.01 and 0 <= p <= 127 and e > 0:
-            out.append((round(max(0.0, s), 4), round(e, 4), p, float(np.clip(v, 0.05, 1.0))))
+            out.append((round(max(0.0, s), 4), round(e, 4), p, float(np.clip(v, 0.05, 1.0)), *([lyric] if lyric else [])))
     return sorted(out)
 
 
@@ -296,12 +368,21 @@ def _midi_tracks(path):
 
     pm = pretty_midi.PrettyMIDI(str(path))
     _, tempi = pm.get_tempo_changes()
+    enc = _midi_text_encoding([ly.text for ly in pm.lyrics])
+    lyrics = [(ly.time, _midi_text_in(ly.text, enc).strip()) for ly in pm.lyrics]
+    lyrics = [(t, x) for t, x in lyrics if x]
     tracks = []
     for i, inst in enumerate(pm.instruments):
         if not inst.notes:
             continue
         name = inst.name.strip() or ("드럼" if inst.is_drum else pretty_midi.program_to_instrument_name(inst.program))
-        notes = [(n.start, n.end, n.pitch, (n.velocity - 30) / 90) for n in inst.notes]
+        notes = [[n.start, n.end, n.pitch, (n.velocity - 30) / 90] for n in sorted(inst.notes, key=lambda n: n.start)]
+        if lyrics and not inst.is_drum:  # 가사는 파일 전체에 하나: 시작이 거의 같은 음표에 붙인다
+            starts = np.array([n[0] for n in notes])
+            for t, text in lyrics:
+                k = int(np.argmin(np.abs(starts - t)))
+                if abs(starts[k] - t) < 0.06 and len(notes[k]) == 4:
+                    notes[k].append(text)
         tracks.append({"name": name or f"트랙 {i + 1}", "drum": bool(inst.is_drum), "notes": clean_input(notes)})
     return tracks, float(tempi[0]) if len(tempi) else 120.0
 
@@ -336,7 +417,7 @@ def _ustx_tracks(path):
         for n in part.get("notes") or []:
             a = off + int(n["position"])
             by_track.setdefault(int(part.get("track_no", 0)), []).append(
-                (conv(a), conv(a + int(n["duration"])), int(n["tone"]), 0.8))
+                (conv(a), conv(a + int(n["duration"])), int(n["tone"]), 0.8, str(n.get("lyric") or "")))
     tracks = [{"name": names[k] if k < len(names) else f"트랙 {k + 1}", "drum": False, "notes": clean_input(v)}
               for k, v in sorted(by_track.items())]
     return tracks, tempos[0][1]
@@ -366,7 +447,7 @@ def _ust_tracks(path):
         dur = length / TICKS * 60 / bpm
         lyric = s.get("Lyric", "R").strip()
         if lyric not in ("R", "r", "") and s.get("NoteNum"):
-            notes.append((sec, sec + dur, int(s["NoteNum"]), 0.8))
+            notes.append((sec, sec + dur, int(s["NoteNum"]), 0.8, lyric))
         tick += length
         sec += dur
     return [{"name": setting.get("ProjectName") or Path(path).stem, "drum": False, "notes": clean_input(notes)}], first_bpm
@@ -394,24 +475,24 @@ def clean_notes(notes, tempo, quantize=False):
     """한 음씩 부르는 파트로 정리: 겹치는 음 자르기, 아주 짧은 음 합치기, (선택) 16분음표 격자에 맞추기."""
     notes = sorted(notes)
     out = []
-    for s, e, p, v in notes:
+    for s, e, p, v, *lyric in notes:
         if out and s < out[-1][1]:  # overlap: end the previous note here
             out[-1][1] = s
         if out and out[-1][1] - out[-1][0] < 0.06:
             out.pop()
-        out.append([s, e, p, v])
+        out.append([s, e, p, v, *lyric])
     out = [n for n in out if n[1] - n[0] >= 0.06]
     if quantize:
         step = 60 / tempo / 4
         q = []
-        for s, e, p, v in out:
+        for s, e, p, v, *lyric in out:
             s2, e2 = round(s / step) * step, round(e / step) * step
             if e2 <= s2:
                 e2 = s2 + step
             if q and s2 < q[-1][1]:
                 s2 = q[-1][1]
             if e2 > s2:
-                q.append([s2, e2, p, v])
+                q.append([s2, e2, p, v, *lyric])
         out = q
     return [tuple(n) for n in out]
 
@@ -448,12 +529,13 @@ def write_ustx(path, notes, tempo, name, waves, lyric="ら"):
     import yaml
 
     vnotes = []
-    for s, e, p, v in notes:
+    for n in notes:
+        s, e, p, v = n[:4]
         a, b = to_ticks(s, tempo), to_ticks(e, tempo)
         if b <= a:
             continue
         vnotes.append({
-            "position": a, "duration": b - a, "tone": int(p), "lyric": lyric,
+            "position": a, "duration": b - a, "tone": int(p), "lyric": lyric_of(n) or lyric,
             "pitch": {"data": [{"x": -25, "y": 0, "shape": "io"}, {"x": 25, "y": 0, "shape": "io"}], "snap_first": True},
             "vibrato": {"length": 0, "period": 175, "depth": 25, "in": 10, "out": 10, "shift": 0, "drift": 0, "vol_link": 0},
             "phoneme_expressions": [], "phoneme_overrides": [],
@@ -486,7 +568,8 @@ def write_ustx(path, notes, tempo, name, waves, lyric="ら"):
 
 
 def write_ust(path, notes, tempo, name, lyric="ら"):
-    """UTAU용 .ust (쉼표는 R 음표로 채운다). Shift-JIS로 저장 (UTAU 기본)."""
+    """UTAU용 .ust (쉼표는 R 음표로 채운다). Shift-JIS로 저장 (UTAU 기본).
+    한글처럼 Shift-JIS에 없는 글자가 있으면 UTF-8로 (OpenUtau · 새 UTAU는 Charset=UTF-8을 읽는다)."""
     lines = ["[#VERSION]", "UST Version1.2", "[#SETTING]", f"Tempo={tempo:.2f}", "Tracks=1",
              f"ProjectName={name}", "VoiceDir=%VOICE%", "OutFile=", "CacheDir=", "Tool1=wavtool.exe",
              "Tool2=resampler.exe", "Mode2=True"]
@@ -498,7 +581,8 @@ def write_ust(path, notes, tempo, name, lyric="ら"):
                       "PreUtterance=", "Intensity=100", "Modulation=0"])
         idx += 1
 
-    for s, e, p, v in notes:
+    for n in notes:
+        s, e, p, v = n[:4]
         a, b = to_ticks(s, tempo), to_ticks(e, tempo)
         if b <= a:
             continue
@@ -508,8 +592,15 @@ def write_ust(path, notes, tempo, name, lyric="ら"):
             a = cursor
             if b <= a:
                 continue
-        note(b - a, lyric, int(p))
+        note(b - a, lyric_of(n) or lyric, int(p))
         cursor = b
     lines.append("[#TRACKEND]")
-    Path(path).write_bytes(("\r\n".join(lines) + "\r\n").encode("shift_jis", errors="replace"))
+    text = "\r\n".join(lines) + "\r\n"
+    try:  # 가사가 전부 Shift-JIS에 있으면 예전처럼 (프로젝트 이름의 한글은 ?로)
+        for n in notes:
+            (lyric_of(n) or "").encode("shift_jis")
+        data = text.encode("shift_jis", errors="replace")
+    except UnicodeEncodeError:
+        data = text.replace("UST Version1.2", "UST Version1.2\r\nCharset=UTF-8", 1).encode("utf-8")
+    Path(path).write_bytes(data)
     return idx

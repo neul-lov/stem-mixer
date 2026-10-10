@@ -33,18 +33,20 @@ struct Preset: Identifiable {
     var rest = 100
     /// Only shown for songs that have this stem (guitar / piano presets).
     var requires: String?
+    /// Number key that applies it (0–5).
+    var key: Int?
     var id: String { name }
 
     func volume(for stem: String) -> Int { values[stem] ?? rest }
 
     static let all: [Preset] = [
-        Preset(name: "원곡", values: [:]),
+        Preset(name: "원곡", values: [:], key: 0),
         Preset(name: "노래방", values: ["vocals": 0]),
-        Preset(name: "보컬만", values: ["vocals": 100], rest: 0),
-        Preset(name: "베이스만", values: ["bass": 100], rest: 0),
-        Preset(name: "드럼만", values: ["drums": 100], rest: 0),
-        Preset(name: "기타만", values: ["guitar": 100], rest: 0, requires: "guitar"),
-        Preset(name: "피아노만", values: ["piano": 100], rest: 0, requires: "piano"),
+        Preset(name: "보컬만", values: ["vocals": 100], rest: 0, key: 1),
+        Preset(name: "베이스만", values: ["bass": 100], rest: 0, key: 2),
+        Preset(name: "드럼만", values: ["drums": 100], rest: 0, key: 3),
+        Preset(name: "기타만", values: ["guitar": 100], rest: 0, requires: "guitar", key: 4),
+        Preset(name: "피아노만", values: ["piano": 100], rest: 0, requires: "piano", key: 5),
         Preset(name: "베이스 연습", values: ["vocals": 40, "bass": 0, "drums": 100], rest: 60),
         Preset(name: "베이스 크게", values: ["vocals": 60, "bass": 180, "drums": 80], rest: 60),
         Preset(name: "기타 연습", values: ["guitar": 0], requires: "guitar"),
@@ -53,6 +55,11 @@ struct Preset: Identifiable {
 
     static func available(for stems: [String]) -> [Preset] {
         all.filter { $0.requires.map(stems.contains) ?? true }
+    }
+
+    /// The preset on a number key, if this song has the stems for it (4 · 5 only in 6-track songs).
+    static func forKey(_ key: Int, stems: [String]) -> Preset? {
+        available(for: stems).first { $0.key == key }
     }
 }
 
@@ -399,6 +406,40 @@ final class AppModel: ObservableObject {
             renderedMix = nil
             await refreshStorage()
             show("\(Self.bytes(freed)) 비웠어요")
+        }
+    }
+
+    /// Progress of turning old wav tracks into FLAC (nil when not running).
+    @Published var compacting: (step: String, progress: Double)?
+
+    /// Converts every old wav track to FLAC: same sound, about half the space.
+    func compactLibrary() {
+        guard compacting == nil else { return }
+        compacting = ("시작하는 중", 0)
+        Task {
+            defer { compacting = nil }
+            do {
+                let id = try await backend.compact()
+                var misses = 0
+                while true {
+                    try await Task.sleep(for: .milliseconds(500))
+                    guard let status = try? await backend.job(id) else {
+                        misses += 1
+                        if misses >= 20 { throw engineStopped() }
+                        continue
+                    }
+                    misses = 0
+                    if status.status == "error" { throw BackendError(message: status.error ?? "바꾸지 못했어요") }
+                    compacting = (status.step ?? "", status.progress ?? 0)
+                    if status.status == "done" {
+                        await refreshStorage()
+                        show("\(Self.bytes(status.freed ?? 0)) 줄였어요")
+                        return
+                    }
+                }
+            } catch {
+                show(error.localizedDescription, success: false)
+            }
         }
     }
 
@@ -882,6 +923,42 @@ final class AppModel: ObservableObject {
             withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) { editor = ed }
             setEditorListen(.both)
             then?(ed)
+            if ed.canShowPitch { loadPitch(ed, songID: song.id) }
+        }
+    }
+
+    /// Draws the original voice's pitch behind the notes; reads it first when this track has none yet.
+    func loadPitch(_ ed: NoteEditor, songID: String) {
+        Task {
+            do {
+                if let curve = try await backend.pitchCurve(songID, stem: ed.stem) {
+                    ed.setPitch(curve)
+                    return
+                }
+                ed.pitchState = .loading(0)
+                let id = try await backend.startPitch(songID, stem: ed.stem)
+                var misses = 0
+                while editor === ed {
+                    try await Task.sleep(for: .milliseconds(700))
+                    guard let status = try? await backend.job(id) else {
+                        misses += 1
+                        if misses >= 20 { throw engineStopped() }
+                        continue
+                    }
+                    misses = 0
+                    if status.status == "error" { throw BackendError(message: status.error ?? "음 높이를 읽지 못했어요") }
+                    ed.pitchState = status.step == "대기 중" ? .waiting : .loading(status.progress ?? 0)
+                    if status.status == "done" {
+                        guard let curve = try await backend.pitchCurve(songID, stem: ed.stem) else {
+                            throw BackendError(message: "음 높이를 읽지 못했어요")
+                        }
+                        ed.setPitch(curve)
+                        return
+                    }
+                }
+            } catch {
+                ed.pitchState = .failed(error.localizedDescription)
+            }
         }
     }
 
@@ -904,6 +981,7 @@ final class AppModel: ObservableObject {
     /// Saves the notes and re-plays the MIDI track, so you hear the edit.
     func applyEditor(close: Bool) {
         guard let song, let ed = editor, !ed.saving else { return }
+        ed.canvas?.endLyric()  // a lyric still being typed counts
         if !ed.dirty, ed.exists || ed.notes.isEmpty {
             if close { finishEditing() }
             return
@@ -936,6 +1014,7 @@ final class AppModel: ObservableObject {
     @discardableResult
     func closeEditor() -> Bool {
         guard let ed = editor else { return true }
+        ed.canvas?.endLyric()
         if ed.dirty {
             let alert = NSAlert()
             alert.messageText = "고친 음표를 적용할까요?"
@@ -968,6 +1047,7 @@ final class AppModel: ObservableObject {
 
     func resetEditorNotes() {
         guard let song, let ed = editor else { return }
+        ed.canvas?.endLyric()
         let alert = NSAlert()
         alert.messageText = "AI가 뽑은 음표로 되돌릴까요?"
         alert.informativeText = "직접 고치거나 가져온 \(StemInfo.of(ed.stem).label) 음표가 사라져요."
@@ -1017,6 +1097,7 @@ final class AppModel: ObservableObject {
                 let file = try await backend.readNotesFile(url)
                 guard let notes = pickTrack(file) else { return }
                 editNotes(stem) { ed in
+                    ed.canvas?.endLyric()
                     var add = false
                     if !ed.notes.isEmpty {
                         let alert = NSAlert()
@@ -1075,27 +1156,68 @@ final class AppModel: ObservableObject {
         s.replacingOccurrences(of: "/", with: "-").replacingOccurrences(of: ":", with: "-")
     }
 
-    /// The stem file under a readable name ("곡 제목 - 보컬.wav"), so editing apps name the track sensibly.
-    func namedStem(_ stem: String, of song: Song) -> URL? {
+    /// Where a stem goes under a readable name ("곡 제목 - 보컬.wav"), so editing apps name the track sensibly.
+    private func namedStemTarget(_ stem: String, of song: Song) -> (source: URL, url: URL) {
         let dir = exportCache.appendingPathComponent(song.id, isDirectory: true)
         let mine = song.replaced?[stem]?.use == true ? " (내 녹음)" : ""
-        let url = dir.appendingPathComponent("\(safeName(song.title)) - \(StemInfo.of(stem).label)\(mine).wav")
-        let fm = FileManager.default
-        try? fm.removeItem(at: url)  // the track may have been re-recorded since
-        do {
-            try fm.createDirectory(at: dir, withIntermediateDirectories: true)
-            let source = backend.activeStemURL(song, stem)
-            // A hard link costs no space; fall back to a copy on another volume.
-            do { try fm.linkItem(at: source, to: url) } catch { try fm.copyItem(at: source, to: url) }
-            return url
-        } catch {
-            return nil
-        }
+        return (backend.activeStemURL(song, stem),
+                dir.appendingPathComponent("\(safeName(song.title)) - \(StemInfo.of(stem).label)\(mine).wav"))
+    }
+
+    func namedStem(_ stem: String, of song: Song) -> URL? {
+        let (source, url) = namedStemTarget(stem, of: song)
+        return Self.materialize(source, at: url) ? url : nil
     }
 
     func namedStems() -> [URL] {
         guard let song else { return [] }
         return song.allTracks.compactMap { namedStem($0, of: song) }
+    }
+
+    /// Puts the track at `url` as wav: a hard link to an old wav track (costs no space), or the FLAC unpacked
+    /// once (again only when the track changes: the copy carries the track's modification date).
+    nonisolated private static func materialize(_ source: URL, at url: URL) -> Bool {
+        let fm = FileManager.default
+        do {
+            try fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            if source.pathExtension == "flac" {
+                func modified(_ u: URL) -> Date? { try? u.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate }
+                guard let changed = modified(source) else { return false }
+                // Same date as the track (within rounding of the stored time) = unpacked from this version.
+                if let made = modified(url), abs(made.timeIntervalSince(changed)) < 0.01 { return true }
+                try Mixer.writeWav(from: source, to: url)
+                try? fm.setAttributes([.modificationDate: changed], ofItemAtPath: url.path)
+                return true
+            }
+            try? fm.removeItem(at: url)  // the track may have been re-recorded since
+            // A hard link costs no space; fall back to a copy on another volume.
+            do { try fm.linkItem(at: source, to: url) } catch { try fm.copyItem(at: source, to: url) }
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    /// Unpacks FLAC tracks in the background when the pointer reaches a drag handle, so the drag starts at once.
+    func prepareNamedStems(_ stems: [String]) {
+        guard let song else { return }
+        let jobs = stems.map { namedStemTarget($0, of: song) }.filter { $0.source.pathExtension == "flac" }
+        guard !jobs.isEmpty else { return }
+        Task.detached(priority: .userInitiated) {
+            for job in jobs { _ = AppModel.materialize(job.source, at: job.url) }
+        }
+    }
+
+    /// The named stems, unpacked off the main thread (for copy / reveal, which don't need them at once).
+    private func namedStemsLater(_ stems: [String], then done: @escaping ([URL]) -> Void) {
+        guard let song else { return }
+        let jobs = stems.map { namedStemTarget($0, of: song) }
+        Task {
+            let urls = await Task.detached(priority: .userInitiated) {
+                jobs.compactMap { AppModel.materialize($0.source, at: $0.url) ? $0.url : nil }
+            }.value
+            done(urls)
+        }
     }
 
     private func putOnPasteboard(_ urls: [URL]) {
@@ -1105,21 +1227,26 @@ final class AppModel: ObservableObject {
     }
 
     func copyStem(_ stem: String) {
-        guard let song, let url = namedStem(stem, of: song) else { return }
-        putOnPasteboard([url])
-        show("\(StemInfo.of(stem).label) 트랙을 복사했어요")
+        namedStemsLater([stem]) { urls in
+            guard !urls.isEmpty else { return }
+            self.putOnPasteboard(urls)
+            self.show("\(StemInfo.of(stem).label) 트랙을 복사했어요")
+        }
     }
 
     func copyAllStems() {
-        let urls = namedStems()
-        guard !urls.isEmpty else { return }
-        putOnPasteboard(urls)
-        show("트랙 \(urls.count)개를 복사했어요")
+        guard let song else { return }
+        namedStemsLater(song.allTracks) { urls in
+            guard !urls.isEmpty else { return }
+            self.putOnPasteboard(urls)
+            self.show("트랙 \(urls.count)개를 복사했어요")
+        }
     }
 
     func revealStem(_ stem: String) {
-        guard let song, let url = namedStem(stem, of: song) else { return }
-        NSWorkspace.shared.activateFileViewerSelecting([url])
+        namedStemsLater([stem]) { urls in
+            if !urls.isEmpty { NSWorkspace.shared.activateFileViewerSelecting(urls) }
+        }
     }
 
     /// Identifies the current mix, so a rendered file is reused until a slider changes.
@@ -1185,17 +1312,33 @@ final class AppModel: ObservableObject {
         panel.directoryURL = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
         guard panel.runModal() == .OK, let base = panel.url else { return }
         let dir = base.appendingPathComponent("\(safeName(song.title)) 트랙", isDirectory: true)
-        do {
-            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-            for stem in song.allTracks {
-                let target = dir.appendingPathComponent("\(safeName(song.title)) - \(StemInfo.of(stem).label).wav")
-                try? FileManager.default.removeItem(at: target)
-                try FileManager.default.copyItem(at: backend.activeStemURL(song, stem), to: target)
+        let jobs = song.allTracks.map {
+            (backend.activeStemURL(song, $0), dir.appendingPathComponent("\(safeName(song.title)) - \(StemInfo.of($0).label).wav"))
+        }
+        show("트랙 \(jobs.count)개를 wav로 저장하는 중…")
+        Task {
+            // FLAC tracks are unpacked to wav, off the main thread (a few seconds for a 6-track song).
+            let result = await Task.detached(priority: .userInitiated) {
+                Result {
+                    let fm = FileManager.default
+                    try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+                    for (source, target) in jobs {
+                        if source.pathExtension == "flac" {
+                            try Mixer.writeWav(from: source, to: target)
+                        } else {
+                            try? fm.removeItem(at: target)
+                            try fm.copyItem(at: source, to: target)
+                        }
+                    }
+                }
+            }.value
+            switch result {
+            case .success:
+                NSWorkspace.shared.activateFileViewerSelecting([dir])
+                show("트랙 \(jobs.count)개를 저장했어요")
+            case .failure:
+                show("저장하지 못했어요", success: false)
             }
-            NSWorkspace.shared.activateFileViewerSelecting([dir])
-            show("트랙 \(song.allTracks.count)개를 저장했어요")
-        } catch {
-            show("저장하지 못했어요", success: false)
         }
     }
 
@@ -1227,16 +1370,24 @@ final class AppModel: ObservableObject {
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
         let window = event.window ?? NSApp.keyWindow
         var typing = window?.firstResponder is NSTextView
+        // Sheets (가사 한꺼번에 넣기 …) and the lyric field keep their own keys.
+        let sheet = window?.sheetParent != nil || window?.attachedSheet != nil
+        let lyric = (window?.firstResponder as? NSTextView)?.delegate is LyricField
+        if lyric, let ed = editor, flags == .command, event.keyCode == UInt16(kVK_ANSI_S) {
+            ed.canvas?.endLyric()
+            applyEditor(close: false)
+            return true
+        }
         // An empty, focused link field shouldn't swallow Space: leave the field and play instead.
-        if typing, input.isEmpty, song != nil, event.keyCode == UInt16(kVK_Space), flags.isEmpty {
+        if typing, !sheet, !lyric, input.isEmpty, song != nil, event.keyCode == UInt16(kVK_Space), flags.isEmpty {
             leaveTextField(window)
             typing = false
         }
-        if typing, event.keyCode == UInt16(kVK_Escape) {
+        if typing, !sheet, !lyric, event.keyCode == UInt16(kVK_Escape) {  // the lyric field (and its IME) handles Esc
             leaveTextField(window)
             return true
         }
-        if let ed = editor, !typing, recordingStem == nil, window?.attachedSheet == nil {
+        if let ed = editor, !typing, recordingStem == nil, !sheet {
             return handleEditorKey(event, ed)
         }
         if flags == .command, event.keyCode == UInt16(kVK_ANSI_C), !typing, song != nil {
@@ -1258,10 +1409,10 @@ final class AppModel: ObservableObject {
         case kVK_Space: togglePlay()
         case kVK_RightArrow: seek(mixer.currentTime + 5)
         case kVK_LeftArrow: seek(mixer.currentTime - 5)
-        case kVK_ANSI_0: apply(Preset.all[0])
-        case kVK_ANSI_1: apply(Preset.all[2])
-        case kVK_ANSI_2: apply(Preset.all[3])
-        case kVK_ANSI_3: apply(Preset.all[4])
+        case kVK_ANSI_0, kVK_ANSI_1, kVK_ANSI_2, kVK_ANSI_3, kVK_ANSI_4, kVK_ANSI_5:
+            let number = [kVK_ANSI_0, kVK_ANSI_1, kVK_ANSI_2, kVK_ANSI_3, kVK_ANSI_4, kVK_ANSI_5].firstIndex(of: Int(event.keyCode))!
+            guard let preset = Preset.forKey(number, stems: song?.stems ?? []) else { return false }
+            withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) { apply(preset) }
         default: return false
         }
         return true

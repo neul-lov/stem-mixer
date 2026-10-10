@@ -238,11 +238,14 @@ func formatTime(_ seconds: Double) -> String {
 /// `files` is asked for at drag start, so it can return files made just then.
 struct FileDragSource<Label: View>: NSViewRepresentable {
     let files: () -> [URL]
+    /// Called when the pointer reaches the handle, to get the files ready before a drag starts.
+    var prepare: () -> Void = {}
     @ViewBuilder let label: () -> Label
 
     func makeNSView(context: Context) -> DragHostView {
         let view = DragHostView()
         view.files = files
+        view.prepare = prepare
         let host = NSHostingView(rootView: AnyView(label()))
         host.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(host)
@@ -257,6 +260,7 @@ struct FileDragSource<Label: View>: NSViewRepresentable {
 
     func updateNSView(_ view: DragHostView, context: Context) {
         view.files = files
+        view.prepare = prepare
         (view.subviews.first as? NSHostingView<AnyView>)?.rootView = AnyView(label())
     }
 
@@ -266,7 +270,16 @@ struct FileDragSource<Label: View>: NSViewRepresentable {
 
     final class DragHostView: NSView, NSDraggingSource {
         var files: () -> [URL] = { [] }
+        var prepare: () -> Void = {}
         private var downEvent: NSEvent?
+
+        override func updateTrackingAreas() {
+            super.updateTrackingAreas()
+            trackingAreas.forEach(removeTrackingArea)
+            addTrackingArea(NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect], owner: self))
+        }
+
+        override func mouseEntered(with event: NSEvent) { prepare() }
 
         // Take the mouse ourselves instead of the hosted SwiftUI label.
         override func hitTest(_ point: NSPoint) -> NSView? { frame.contains(point) ? self : nil }

@@ -10,6 +10,8 @@ struct EditNote: Identifiable, Equatable {
     var end: Double
     var pitch: Int
     var velocity: Double
+    /// Sung text for OpenUtau / UTAU export ("" = none).
+    var lyric = ""
 }
 
 /// The notes being edited for one track, with selection, undo and the view position.
@@ -53,6 +55,29 @@ final class NoteEditor: ObservableObject, Identifiable {
     }
     @Published var listen: Listen = .both
 
+    // The original voice's pitch, every `pitchHop` seconds (NaN = silent), drawn as a line behind the notes.
+    enum PitchState: Equatable { case none, waiting, loading(Double), ready, failed(String) }
+    @Published var pitchState: PitchState = .none
+    private(set) var pitchCurve: [Float] = []
+    private(set) var pitchHop: Double = 0.01
+    @Published var showPitch = UserDefaults.standard.object(forKey: "editor.pitch") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(showPitch, forKey: "editor.pitch"); canvas?.needsDisplay = true }
+    }
+    /// Only one-note-at-a-time parts have a single pitch to draw.
+    var canShowPitch: Bool { stem == "vocals" || stem == "bass" }
+
+    func setPitch(_ curve: Backend.PitchCurve) {
+        pitchHop = curve.hop > 0 ? curve.hop : 0.01
+        pitchCurve = curve.midi.map { $0.map(Float.init) ?? .nan }
+        pitchState = .ready
+        canvas?.needsDisplay = true
+    }
+
+    /// Opens the "가사 한꺼번에 넣기" sheet.
+    @Published var lyricSheet = false {
+        didSet { if lyricSheet { canvas?.endLyric() } }
+    }
+
     // View position (not published: only the canvas draws from them).
     var viewStart: Double = 0
     var pxPerSec: CGFloat = 120
@@ -77,18 +102,27 @@ final class NoteEditor: ObservableObject, Identifiable {
 
     private func make(_ n: MidiNote) -> EditNote {
         nextID += 1
-        return EditNote(id: nextID, start: n.start, end: n.end, pitch: n.pitch, velocity: n.velocity)
+        return EditNote(id: nextID, start: n.start, end: n.end, pitch: n.pitch, velocity: n.velocity, lyric: n.lyric ?? "")
     }
 
-    func newNote(start: Double, end: Double, pitch: Int, velocity: Double = 0.8) -> EditNote {
+    func newNote(start: Double, end: Double, pitch: Int, velocity: Double = 0.8, lyric: String = "") -> EditNote {
         nextID += 1
-        return EditNote(id: nextID, start: start, end: end, pitch: pitch, velocity: velocity)
+        return EditNote(id: nextID, start: start, end: end, pitch: pitch, velocity: velocity, lyric: lyric)
+    }
+
+    /// A new note with the same pitch, length and lyric, moved by `offset` seconds.
+    func copy(of n: EditNote, by offset: Double = 0) -> EditNote {
+        newNote(start: n.start + offset, end: n.end + offset, pitch: n.pitch, velocity: n.velocity, lyric: n.lyric)
     }
 
     var midiNotes: [MidiNote] {
         notes.sorted { ($0.start, $0.pitch) < ($1.start, $1.pitch) }
-            .map { MidiNote(start: $0.start, end: $0.end, pitch: $0.pitch, velocity: $0.velocity) }
+            .map { MidiNote(start: $0.start, end: $0.end, pitch: $0.pitch, velocity: $0.velocity,
+                            lyric: $0.lyric.isEmpty ? nil : $0.lyric) }
     }
+
+    /// Notes in singing order: by start, the top note first when several start together.
+    var inOrder: [EditNote] { notes.sorted { ($0.start, -$0.pitch) < ($1.start, -$1.pitch) } }
 
     var selected: [EditNote] { notes.filter { selection.contains($0.id) } }
 
@@ -201,7 +235,7 @@ final class NoteEditor: ObservableObject, Identifiable {
         guard let first = clipboard.map(\.start).min() else { return }
         checkpoint()
         let offset = snap(time) - first
-        let made = clipboard.map { newNote(start: $0.start + offset, end: $0.end + offset, pitch: $0.pitch, velocity: $0.velocity) }
+        let made = clipboard.map { copy(of: $0, by: offset) }
         notes += made
         selection = Set(made.map(\.id))
     }
@@ -213,10 +247,59 @@ final class NoteEditor: ObservableObject, Identifiable {
         checkpoint()
         var span = b - a
         if step > 0 { span = max(step, (span / step).rounded(.up) * step) }
-        let made = sel.map { newNote(start: $0.start + span, end: $0.end + span, pitch: $0.pitch, velocity: $0.velocity) }
+        let made = sel.map { copy(of: $0, by: span) }
         notes += made
         selection = Set(made.map(\.id))
     }
+
+    // MARK: Lyrics
+
+    /// Which notes "가사 한꺼번에 넣기" fills.
+    enum LyricTarget: Hashable { case selected, fromSelected, all }
+
+    func lyricTargets(_ target: LyricTarget) -> [EditNote] {
+        let ordered = inOrder
+        switch target {
+        case .all: return ordered
+        case .selected: return ordered.filter { selection.contains($0.id) }
+        case .fromSelected:
+            guard let first = ordered.firstIndex(where: { selection.contains($0.id) }) else { return ordered }
+            return Array(ordered[first...])
+        }
+    }
+
+    /// Puts the syllables on the notes in singing order. Returns how many notes got one.
+    @discardableResult
+    func applyLyrics(_ syllables: [String], to target: LyricTarget) -> Int {
+        canvas?.endLyric()
+        let targets = lyricTargets(target)
+        let count = min(targets.count, syllables.count)
+        guard count > 0 else { return 0 }
+        checkpoint()
+        var byID: [Int: String] = [:]
+        for i in 0..<count { byID[targets[i].id] = syllables[i] }
+        for i in notes.indices { if let text = byID[notes[i].id] { notes[i].lyric = text } }
+        return count
+    }
+
+    func setLyric(_ text: String, for id: Int) {
+        let clean = String(text.split(whereSeparator: \.isNewline).joined(separator: " ")
+            .trimmingCharacters(in: .whitespaces).prefix(32))
+        guard let i = notes.firstIndex(where: { $0.id == id }), notes[i].lyric != clean else { return }
+        checkpoint()
+        notes[i].lyric = clean
+    }
+
+    /// Clears the lyrics of the selected notes (all notes if none).
+    func clearLyrics() {
+        canvas?.endLyric()
+        let ids = selection.isEmpty ? Set(notes.map(\.id)) : selection
+        guard notes.contains(where: { ids.contains($0.id) && !$0.lyric.isEmpty }) else { return }
+        checkpoint()
+        for i in notes.indices where ids.contains(notes[i].id) { notes[i].lyric = "" }
+    }
+
+    var hasLyrics: Bool { notes.contains { !$0.lyric.isEmpty } }
 
     // MARK: View
 
@@ -382,7 +465,7 @@ final class NoteCanvasView: NSView {
         let w = bounds.width, h = bounds.height
         let t = model?.time ?? 0
         // Follow the playhead while playing.
-        if model?.playing == true, case .none = drag {
+        if model?.playing == true, case .none = drag, lyricNote == nil {
             let visible = Double((w - keyW) / e.pxPerSec)
             if t < e.viewStart || t > e.viewStart + visible * 0.92 { e.viewStart = max(0, t - visible * 0.08) }
         }
@@ -455,11 +538,27 @@ final class NoteCanvasView: NSView {
                 ctx.setLineWidth(1)
                 ctx.strokePath()
             }
-            if r.width > 30, e.rowHeight >= 12 {
-                let label = Self.name(n.pitch) as NSString
-                label.draw(at: CGPoint(x: r.minX + 4, y: r.minY + (r.height - 11) / 2 - 1),
-                           withAttributes: [.font: NSFont.systemFont(ofSize: 9, weight: .bold),
-                                            .foregroundColor: NSColor.white.withAlphaComponent(0.9)])
+        }
+
+        // The pitch the original voice actually sings, over the notes so you see where they differ.
+        if e.showPitch, e.pitchState == .ready, !e.pitchCurve.isEmpty {
+            drawPitch(e, ctx, from: t0, to: t1)
+        }
+
+        // Lyrics (or the pitch name) on the notes.
+        if e.rowHeight >= 10 {
+            for n in e.notes where n.end > t0 && n.start < t1 && n.id != lyricNote {
+                let r = rect(n)
+                let text = n.lyric.isEmpty ? (r.width > 30 && e.rowHeight >= 12 ? Self.name(n.pitch) : nil) : n.lyric
+                guard let text, r.width > 12 else { continue }
+                let font = n.lyric.isEmpty ? NSFont.systemFont(ofSize: 9, weight: .bold)
+                                           : NSFont.systemFont(ofSize: min(12, max(9, e.rowHeight - 3)), weight: .semibold)
+                let attrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: NSColor.white.withAlphaComponent(0.95)]
+                let size = (text as NSString).size(withAttributes: attrs)
+                ctx.saveGState()
+                ctx.clip(to: r.insetBy(dx: 2, dy: 0))
+                (text as NSString).draw(at: CGPoint(x: r.minX + 4, y: r.midY - size.height / 2), withAttributes: attrs)
+                ctx.restoreGState()
             }
         }
 
@@ -539,6 +638,124 @@ final class NoteCanvasView: NSView {
         }
     }
 
+    private func drawPitch(_ e: NoteEditor, _ ctx: CGContext, from t0: Double, to t1: Double) {
+        let curve = e.pitchCurve, hop = e.pitchHop
+        let i0 = max(0, Int(t0 / hop) - 1), i1 = min(curve.count - 1, Int(t1 / hop) + 1)
+        guard i0 < i1 else { return }
+        // About one point per pixel when zoomed out.
+        let stride = max(1, Int(1 / (Double(e.pxPerSec) * hop)))
+        let path = CGMutablePath()
+        var last: Float = .nan
+        var i = i0
+        while i <= i1 {
+            let m = curve[i]
+            if m.isNaN {
+                last = .nan
+            } else {
+                let p = CGPoint(x: x(Double(i) * hop), y: rulerH + CGFloat(e.topPitch - Double(m)) * e.rowHeight + e.rowHeight / 2)
+                // Jumps of more than 3 semitones are breaks (an octave slip, a new phrase), not slides.
+                if last.isNaN || abs(m - last) > 3 { path.move(to: p) } else { path.addLine(to: p) }
+                last = m
+            }
+            i += stride
+        }
+        ctx.saveGState()
+        ctx.addPath(path)
+        ctx.setLineJoin(.round)
+        ctx.setLineCap(.round)
+        // A light halo first so the line reads on top of the colored notes too.
+        ctx.setStrokeColor(NSColor.textBackgroundColor.withAlphaComponent(0.7).cgColor)
+        ctx.setLineWidth(3)
+        ctx.strokePath()
+        ctx.addPath(path)
+        ctx.setStrokeColor(NSColor.labelColor.withAlphaComponent(0.75).cgColor)
+        ctx.setLineWidth(1.4)
+        ctx.strokePath()
+        ctx.restoreGState()
+    }
+
+    // MARK: Lyric typing
+
+    private var lyricField: LyricField?
+    /// The note whose lyric is being typed.
+    private(set) var lyricNote: Int?
+    private var lyricOpenedWith = ""
+    private var movingLyric = false
+
+    /// Starts typing the lyric of a note (the first selected one by default). Return / Tab go to the next note.
+    func beginLyric(_ id: Int? = nil) {
+        guard let e = editor, let target = id ?? e.inOrder.first(where: { e.selection.contains($0.id) })?.id else { return }
+        showLyricField(for: target)
+    }
+
+    private func showLyricField(for id: Int) {
+        if lyricNote != nil { commitLyric() }  // keep what was typed for the last note
+        guard let e = editor, let n = e.notes.first(where: { $0.id == id }) else { return endLyric() }
+        // Bring the note into view.
+        let visible = Double((bounds.width - keyW) / e.pxPerSec)
+        if n.start < e.viewStart || n.end > e.viewStart + visible * 0.9 { e.viewStart = max(0, n.start - visible * 0.15) }
+        let rows = Double((bounds.height - rulerH) / e.rowHeight)
+        if Double(n.pitch) > e.topPitch - 1 || Double(n.pitch) < e.topPitch - rows + 1 {
+            e.topPitch = min(127.5, Double(n.pitch) + rows / 2)
+        }
+        let field = lyricField ?? makeLyricField()
+        movingLyric = true
+        if lyricNote != nil { window?.makeFirstResponder(self) }  // finish the field editor for the last note
+        lyricNote = id
+        lyricOpenedWith = n.lyric
+        e.selection = [id]
+        field.stringValue = n.lyric
+        let r = rect(n)
+        field.frame = CGRect(x: max(keyW, r.minX - 2), y: r.midY - 11, width: max(70, min(r.width + 4, 180)), height: 22)
+        if field.superview == nil { addSubview(field) }
+        window?.makeFirstResponder(field)
+        field.currentEditor()?.selectAll(nil)
+        movingLyric = false
+        needsDisplay = true
+    }
+
+    private func makeLyricField() -> LyricField {
+        let f = LyricField()
+        f.font = .systemFont(ofSize: 12, weight: .semibold)
+        f.placeholderString = "가사"
+        f.alignment = .left
+        f.bezelStyle = .roundedBezel
+        f.cell?.usesSingleLineMode = true
+        f.cell?.lineBreakMode = .byClipping
+        f.delegate = self
+        lyricField = f
+        return f
+    }
+
+    private func commitLyric() {
+        guard let e = editor, let id = lyricNote, let field = lyricField else { return }
+        // Untouched: leave the note alone (a menu or the sheet may have changed its lyric meanwhile).
+        guard field.stringValue != lyricOpenedWith else { return }
+        e.setLyric(field.stringValue, for: id)
+        lyricOpenedWith = field.stringValue
+    }
+
+    /// Next (or previous) note in singing order, with the field moved there; closes after the last one.
+    private func moveLyric(_ direction: Int) {
+        guard let e = editor, let id = lyricNote else { return }
+        commitLyric()
+        let ordered = e.inOrder
+        if let i = ordered.firstIndex(where: { $0.id == id }), ordered.indices.contains(i + direction) {
+            showLyricField(for: ordered[i + direction].id)
+        } else {
+            endLyric(commit: false)
+        }
+    }
+
+    func endLyric(commit: Bool = true) {
+        guard lyricNote != nil else { return }
+        if commit { commitLyric() }
+        lyricNote = nil
+        lyricField?.removeFromSuperview()
+        window?.makeFirstResponder(self)
+        needsDisplay = true
+    }
+
     // MARK: Mouse
 
     override func updateTrackingAreas() {
@@ -562,6 +779,7 @@ final class NoteCanvasView: NSView {
 
     override func mouseDown(with event: NSEvent) {
         guard let e = editor else { return }
+        endLyric()
         window?.makeFirstResponder(self)
         let p = convert(event.locationInWindow, from: nil)
         let flags = event.modifierFlags
@@ -646,7 +864,7 @@ final class NoteCanvasView: NSView {
                 guard abs(p.x - start.x) > 2 || abs(p.y - start.y) > 2 else { return }
                 var copies: [Int: EditNote] = [:]
                 for o in origin.values {
-                    let c = e.newNote(start: o.start, end: o.end, pitch: o.pitch, velocity: o.velocity)
+                    let c = e.copy(of: o)
                     copies[c.id] = c
                     if o.id == anchor0 { anchor = c.id }
                 }
@@ -714,6 +932,7 @@ final class NoteCanvasView: NSView {
 
     override func rightMouseDown(with event: NSEvent) {
         guard let e = editor else { return }
+        endLyric()
         let p = convert(event.locationInWindow, from: nil)
         if let (n, _) = hit(p), !e.selection.contains(n.id) { e.selection = [n.id] }
         let menu = NSMenu()
@@ -723,6 +942,11 @@ final class NoteCanvasView: NSView {
         }
         let at = time(p.x)
         if !e.selection.isEmpty {
+            item("가사 넣기 (Return)") { [weak self] in self?.beginLyric() }
+            if e.selected.contains(where: { !$0.lyric.isEmpty }) {
+                item("가사 지우기") { e.clearLyrics() }
+            }
+            menu.addItem(.separator())
             item("지우기") { e.deleteSelection() }
             item("복제 (바로 뒤에)") { e.duplicateSelection() }
             item("박자 맞추기") { e.quantize() }
@@ -733,6 +957,7 @@ final class NoteCanvasView: NSView {
             item("복사") { e.copySelection() }
             menu.addItem(.separator())
         }
+        item("가사 한꺼번에 넣기…") { e.lyricSheet = true }
         item("여기에 붙여넣기") { e.paste(at: at) }
         item("여기서부터 재생") { [weak self] in
             self?.model?.seek(max(0, at))
@@ -743,6 +968,7 @@ final class NoteCanvasView: NSView {
 
     override func scrollWheel(with event: NSEvent) {
         guard let e = editor else { return }
+        endLyric()
         let p = convert(event.locationInWindow, from: nil)
         var dx = event.scrollingDeltaX, dy = event.scrollingDeltaY
         if !event.hasPreciseScrollingDeltas { dx *= 12; dy *= 12 }
@@ -762,6 +988,7 @@ final class NoteCanvasView: NSView {
     }
 
     override func magnify(with event: NSEvent) {
+        endLyric()
         let p = convert(event.locationInWindow, from: nil)
         editor?.zoom(1 + event.magnification, around: max(p.x, keyW))
     }
@@ -771,6 +998,37 @@ final class NoteCanvasView: NSView {
         needsDisplay = true
     }
 }
+
+extension NoteCanvasView: NSTextFieldDelegate {
+    func control(_ control: NSControl, textView: NSTextView, doCommandBy selector: Selector) -> Bool {
+        switch selector {
+        case #selector(NSResponder.insertNewline(_:)), #selector(NSResponder.insertTab(_:)):
+            moveLyric(1)
+        case #selector(NSResponder.insertBacktab(_:)):
+            moveLyric(-1)
+        case #selector(NSResponder.cancelOperation(_:)):
+            endLyric()
+        default:
+            return false
+        }
+        return true
+    }
+
+    /// Clicked somewhere else: keep what was typed.
+    func controlTextDidEndEditing(_ obj: Notification) {
+        guard !movingLyric, lyricNote != nil else { return }
+        commitLyric()
+        lyricNote = nil
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.lyricNote == nil else { return }
+            self.lyricField?.removeFromSuperview()
+            self.needsDisplay = true
+        }
+    }
+}
+
+/// The small text box for typing a note's lyric (the key handler leaves its keys alone).
+final class LyricField: NSTextField {}
 
 /// An NSMenuItem that runs a closure.
 final class ClosureMenuItem: NSMenuItem {
@@ -833,6 +1091,7 @@ struct NoteEditorView: View {
                 .padding(.horizontal, 20)
                 .padding(.vertical, 10)
         }
+        .sheet(isPresented: $editor.lyricSheet) { LyricsSheet(editor: editor) }
     }
 
     private var header: some View {
@@ -860,6 +1119,11 @@ struct NoteEditorView: View {
             Spacer()
             Menu {
                 Button("MIDI · OpenUtau · UTAU 파일 가져오기…") { model.importNotes(for: editor.stem) }
+                Divider()
+                Button("가사 한꺼번에 넣기…") { editor.lyricSheet = true }
+                    .disabled(editor.notes.isEmpty)
+                Button(editor.selection.isEmpty ? "가사 모두 지우기" : "선택한 음표의 가사 지우기") { editor.clearLyrics() }
+                    .disabled(!editor.hasLyrics)
                 Divider()
                 Button("모든 음표 지우기") {
                     editor.selectAll()
@@ -960,6 +1224,11 @@ struct NoteEditorView: View {
 
             Spacer(minLength: 0)
 
+            if editor.canShowPitch {
+                Toggle(isOn: $editor.showPitch) { Text(pitchLabel).font(.system(size: 11, weight: .semibold)).monospacedDigit() }
+                    .toggleStyle(.checkbox)
+                    .help(pitchHelp)
+            }
             Toggle(isOn: $editor.showGhost) { Text("원래 윤곽").font(.system(size: 11, weight: .semibold)) }
                 .toggleStyle(.checkbox)
                 .help("처음 열었을 때(또는 AI가 뽑은) 음표를 점선으로 보여 줘요")
@@ -967,6 +1236,20 @@ struct NoteEditorView: View {
             toolButton("plus.magnifyingglass", nil, help: "넓게 보기 (⌘ + 스크롤, 핀치)") { editor.zoom(1.4) }
         }
         .font(.system(size: 11.5, weight: .semibold))
+    }
+
+    private var pitchLabel: String {
+        switch editor.pitchState {
+        case .waiting: "음높이 선 (차례 기다리는 중)"
+        case .loading(let p): "음높이 선 읽는 중 \(Int(p * 100))%"
+        case .failed: "음높이 선 (못 읽음)"
+        default: "음높이 선"
+        }
+    }
+
+    private var pitchHelp: String {
+        if case .failed(let message) = editor.pitchState { return message }
+        return "원래 \(info.label)가 실제로 부르는 음높이를 선으로 보여 줘요. 음표가 선보다 높거나 낮은 곳을 고치면 돼요"
     }
 
     private var divider: some View {
@@ -994,6 +1277,7 @@ struct NoteEditorView: View {
             KeyHint("오른쪽 끝", "길이")
             KeyHint("⌥ 끌기", "복사")
             KeyHint("Delete", "지우기")
+            KeyHint("Return", "가사")
             KeyHint("↑ ↓", "반음 (⇧ 옥타브)")
             KeyHint("⌘Z", "되돌리기")
             KeyHint("Space", "재생")
@@ -1031,9 +1315,112 @@ extension AppModel {
             let dir = key == kVK_LeftArrow ? -1 : 1
             if e.selection.isEmpty { seek(time + Double(dir) * 5) } else { e.nudgeSelection(dir) }
         case kVK_ANSI_Q: e.quantize()
+        case kVK_Return, kVK_ANSI_KeypadEnter:
+            guard !e.selection.isEmpty else { return false }
+            e.canvas?.beginLyric()
         case kVK_Escape: e.selection = []
         default: return false
         }
         return true
+    }
+}
+
+// MARK: - Lyrics
+
+enum Lyrics {
+    private static let small: Set<Character> = Set("ぁぃぅぇぉゃゅょゎゕゖァィゥェォャュョヮヵヶ")
+
+    private static func isKana(_ c: Character?) -> Bool {
+        guard let v = c?.unicodeScalars.first?.value else { return false }
+        return (0x3040...0x30FF).contains(v) || (0xFF66...0xFF9D).contains(v)
+    }
+
+    /// Hangul, kana and CJK characters are one note each; other letters (café, niño) build words.
+    private static func isSyllableScript(_ c: Character) -> Bool {
+        guard let v = c.unicodeScalars.first?.value else { return false }
+        return isKana(c) || (0xAC00...0xD7A3).contains(v) || (0x1100...0x11FF).contains(v) || (0x3130...0x318F).contains(v)
+            || (0x3400...0x9FFF).contains(v) || (0xF900...0xFAFF).contains(v) || (0x20000...0x2FFFF).contains(v)
+    }
+
+    /// Splits typed or pasted lyrics into one piece per note: a kana (きゃ keeps its small ゃ), a Hangul
+    /// syllable, a CJK character, or a whole Latin word. Spaces and punctuation only separate.
+    static func split(_ text: String) -> [String] {
+        var out: [String] = []
+        var word = ""
+        func flush() { if !word.isEmpty { out.append(word); word = "" } }
+        for c in text {
+            if !isSyllableScript(c), c.isLetter || c.isNumber || "'’‘+-~".contains(c) {
+                word.append(c)
+                continue
+            }
+            flush()
+            if c.isWhitespace || c.isPunctuation || (c.isSymbol && !isKana(c)) { continue }
+            if small.contains(c), let last = out.last, isKana(last.last), !small.contains(last.last!) {
+                out[out.count - 1].append(c)
+            } else {
+                out.append(String(c))
+            }
+        }
+        flush()
+        return out
+    }
+}
+
+/// "가사 한꺼번에 넣기": paste a verse, and each syllable goes on the next note.
+struct LyricsSheet: View {
+    @ObservedObject var editor: NoteEditor
+    @Environment(\.dismiss) private var dismiss
+    @State private var text = ""
+    @State private var target: NoteEditor.LyricTarget = .all
+
+    private var syllables: [String] { Lyrics.split(text) }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("가사 한꺼번에 넣기").font(.system(size: 15, weight: .bold))
+            Text("가사를 붙여 넣으면 음절마다 음표에 차례로 들어가요. 일본어는 가나 한 글자(きゃ처럼 작은 글자는 앞 글자와 함께), 한국어는 한 글자, 영어는 띄어 쓴 단어 하나가 음표 하나예요.")
+                .font(.system(size: 11.5)).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            TextEditor(text: $text)
+                .font(.system(size: 13))
+                .frame(minHeight: 150)
+                .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(Color.primary.opacity(0.15)))
+            if !editor.selection.isEmpty {
+                Picker("넣을 곳", selection: $target) {
+                    if editor.selection.count > 1 { Text("선택한 음표 \(editor.selection.count)개에만").tag(NoteEditor.LyricTarget.selected) }
+                    Text("선택한 첫 음표부터 끝까지").tag(NoteEditor.LyricTarget.fromSelected)
+                    Text("처음 음표부터").tag(NoteEditor.LyricTarget.all)
+                }
+                .pickerStyle(.radioGroup)
+                .font(.system(size: 12))
+            }
+            Text(summary)
+                .font(.system(size: 11.5, weight: .medium)).foregroundStyle(.secondary)
+                .lineLimit(2)
+            HStack {
+                Spacer()
+                Button("취소") { dismiss() }.keyboardShortcut(.cancelAction)
+                Button("넣기") {
+                    editor.applyLyrics(syllables, to: target)
+                    dismiss()
+                }
+                .keyboardShortcut(.return, modifiers: .command)
+                .disabled(syllables.isEmpty)
+                .help("⌘Return")
+            }
+        }
+        .padding(20)
+        .frame(width: 480)
+        .onAppear {
+            target = editor.selection.count > 1 ? .selected : editor.selection.isEmpty ? .all : .fromSelected
+        }
+    }
+
+    private var summary: String {
+        let notes = editor.lyricTargets(target).count
+        guard !syllables.isEmpty else { return "음표 \(notes)개에 넣을 수 있어요" }
+        let shown = syllables.prefix(12).joined(separator: " · ") + (syllables.count > 12 ? " …" : "")
+        let fit = syllables.count > notes ? " (남는 \(syllables.count - notes)개는 안 들어가요)" : ""
+        return "음절 \(syllables.count)개 → 음표 \(min(notes, syllables.count))개\(fit): \(shown)"
     }
 }

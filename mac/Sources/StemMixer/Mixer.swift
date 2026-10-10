@@ -146,6 +146,30 @@ final class Mixer {
         levelLock.withLock { levels[name] = peak }
     }
 
+    /// Unpacks a track (FLAC) into a 24-bit WAV for apps that want wav. Written aside and moved in place.
+    static func writeWav(from source: URL, to output: URL) throws {
+        let file = try AVAudioFile(forReading: source)
+        let format = file.processingFormat
+        let settings: [String: Any] = [
+            AVFormatIDKey: kAudioFormatLinearPCM, AVSampleRateKey: format.sampleRate,
+            AVNumberOfChannelsKey: format.channelCount, AVLinearPCMBitDepthKey: 24,
+            AVLinearPCMIsFloatKey: false, AVLinearPCMIsBigEndianKey: false,
+        ]
+        let tmp = output.deletingLastPathComponent().appendingPathComponent(".\(UUID().uuidString).wav")
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        do {
+            let out = try AVAudioFile(forWriting: tmp, settings: settings, commonFormat: .pcmFormatFloat32, interleaved: false)
+            let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 65536)!
+            while file.framePosition < file.length {
+                try file.read(into: buffer)
+                if buffer.frameLength == 0 { break }
+                try out.write(from: buffer)
+            }
+        }  // `out` is closed here
+        // rename(2) replaces in one step, so two unpackings of the same track can't trip over each other.
+        guard rename(tmp.path, output.path) == 0 else { throw CocoaError(.fileWriteUnknown) }
+    }
+
     /// Mixes the stems with the given gains into a 16-bit WAV file.
     static func export(_ inputs: [(URL, Double)], to output: URL) throws {
         let files = try inputs.map { (try AVAudioFile(forReading: $0.0), $0.1) }

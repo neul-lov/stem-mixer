@@ -5,12 +5,14 @@
 실행: python server.py  →  http://localhost:8000
 """
 import hashlib
+import io
 import json
 import os
 import re
 import shutil
 import subprocess
 import threading
+import time
 import traceback
 import urllib.request
 import uuid
@@ -21,9 +23,11 @@ import imageio_ffmpeg
 import numpy as np
 import soundfile as sf
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from scipy.signal import butter, sosfiltfilt
+
+import audiofile
 
 ROOT = Path(__file__).parent
 LIBRARY = ROOT / "library"  # 분리된 곡이 쌓이는 곳 (곡마다 폴더 하나)
@@ -416,7 +420,7 @@ def kept_source(key):
 def mix_stems(folder, dest):
     """원본이 없을 때: 이미 나눈 트랙을 다시 합쳐서 원곡을 만든다 (AI 트랙은 합치면 거의 원곡)."""
     meta = json.loads((folder / "meta.json").read_text())
-    total = sum(sf.read(folder / f"{n}.wav", dtype="float32")[0] for n in meta["stems"])
+    total = sum(audiofile.read(folder, n) for n in meta["stems"])
     sf.write(dest, np.clip(total, -1, 1), SR, subtype="PCM_16")
     return dest
 
@@ -477,8 +481,9 @@ def run_job(job_id, mode, text=None, upload_path=None, title=None, resplit=None)
             job.update(step="저장 중", progress=0.99)
             peak = max(float(np.abs(s).max()) for s in stems.values())
             scale = 0.99 / peak if peak > 0.99 else 1.0
-            for name in names:
-                sf.write(folder / f"{name}.wav", stems[name] * scale, SR, subtype="PCM_24")
+            for name in names:  # FLAC: 소리는 wav와 똑같고 크기는 절반쯤
+                audiofile.write(folder, name, stems[name] * scale)
+            shutil.rmtree(folder / "pitch", ignore_errors=True)  # 다시 나눴으면 음높이 선도 다시
             if not kept_source(key):  # 다음에 다른 방식으로 나눌 때 쓰도록 원본 보관
                 shutil.move(src, SOURCES / f"{key}{src.suffix.lower()}")
             src.unlink(missing_ok=True)
@@ -600,6 +605,13 @@ def folder_size(path):
     return total
 
 
+def _size(f):
+    try:
+        return f.stat().st_size
+    except OSError:
+        return 0
+
+
 def _leftovers():
     """지워도 되는 것: 버전이 하나도 안 남은 곡의 원본, 끝난 작업이 남긴 임시 파일."""
     busy = any(j.get("status") == "running" for j in jobs.values())
@@ -608,6 +620,16 @@ def _leftovers():
     temp = [] if busy else [d for d in LIBRARY.iterdir()
                             if d.name.startswith(("stem-", "_upload_")) or
                             (d.is_dir() and d.name not in ("_sources",) and not (d / "meta.json").exists())]
+    if not busy:  # 꺼지는 바람에 곡 폴더 안에 남은 반쯤 쓴 파일 (.vocals-1a2b3c4d.tmp.flac 등)
+        now = time.time()
+        for meta in LIBRARY.glob("*/meta.json"):  # 곡 폴더만 (meta.json 없는 폴더는 위에서 통째로)
+            for pat in (".*.tmp.flac", "user/.*.tmp.flac", "pitch/.*.tmp"):
+                for f in meta.parent.glob(pat):
+                    try:
+                        if now - f.stat().st_mtime > 600:
+                            temp.append(f)
+                    except OSError:
+                        pass
     return orphans, temp, busy
 
 
@@ -618,8 +640,9 @@ def storage():
     return {
         "songs": songs,
         "sources": folder_size(SOURCES),
-        "leftovers": sum(f.stat().st_size for f in orphans) + sum(folder_size(d) if d.is_dir() else d.stat().st_size for d in temp),
+        "leftovers": sum(f.stat().st_size for f in orphans) + sum(folder_size(d) if d.is_dir() else _size(d) for d in temp),
         "models": folder_size(MODEL_DIR) if MODEL_DIR.exists() else 0,
+        "wav": sum(os.path.getsize(f) for f in _wav_tracks() if f.exists()),
         "busy": busy,
     }
 
@@ -633,9 +656,54 @@ def cleanup():
         freed += f.stat().st_size
         f.unlink()
     for d in temp:
-        freed += folder_size(d) if d.is_dir() else d.stat().st_size
-        shutil.rmtree(d, ignore_errors=True) if d.is_dir() else d.unlink()
+        freed += folder_size(d) if d.is_dir() else _size(d)
+        shutil.rmtree(d, ignore_errors=True) if d.is_dir() else d.unlink(missing_ok=True)
     return {"freed": freed, "skipped_temp_because_busy": busy}
+
+
+def _wav_tracks():
+    """예전에 wav로 저장한 트랙 (FLAC으로 바꾸면 절반쯤으로 줄어든다)."""
+    out = []
+    for p in LIBRARY.glob("*/meta.json"):
+        try:
+            stems = json.loads(p.read_text())["stems"]
+        except (OSError, ValueError, KeyError):
+            continue
+        out += audiofile.convertible(p.parent, stems)
+    return out
+
+
+def run_compact(job_id):
+    job = jobs[job_id]
+    try:
+        with work_lock:  # 분리 · 음정 뽑기와 겹치지 않게
+            files = _wav_tracks()
+            freed, done, skipped = 0, 0, 0
+            for i, f in enumerate(files):
+                job.update(step=f"FLAC으로 바꾸는 중 ({i + 1}/{len(files)})", progress=i / max(1, len(files)))
+                try:
+                    got = audiofile.to_flac(f)
+                except Exception:
+                    traceback.print_exc()
+                    got = None
+                if got is None:
+                    skipped += 1
+                else:
+                    freed += got
+                    done += 1
+            job.update(status="done", progress=1.0, freed=freed, converted=done, skipped=skipped)
+    except Exception as e:
+        traceback.print_exc()
+        job.update(status="error", error=f"바꾸지 못했어요: {e}")
+
+
+@app.post("/api/compact")
+def compact():
+    """예전 wav 트랙을 소리 손실 없는 FLAC으로 바꿔서 공간을 줄인다 (샘플이 똑같은지 확인한 뒤에만 wav를 지운다)."""
+    job_id = uuid.uuid4().hex
+    jobs[job_id] = {"status": "running", "step": "대기 중", "progress": 0.0}
+    threading.Thread(target=run_compact, args=(job_id,), daemon=True).start()
+    return {"job_id": job_id}
 
 
 @app.post("/api/songs/delete-many")
@@ -672,15 +740,24 @@ def delete_song(song_id: str):
 
 
 @app.get("/api/songs/{song_id}/{stem}.wav")
-def stem_file(song_id: str, stem: str, original: int = 0):
+def stem_file(song_id: str, stem: str, original: int = 0, wav: int = 0):
+    """트랙 소리. 저장된 그대로(FLAC 또는 예전 wav) 보낸다. wav=1이면 wav로 풀어서 (다른 앱에 넣을 파일 받기)."""
     folder = song_folder(song_id)
     meta = json.loads((folder / "meta.json").read_text())
     user = (meta.get("replaced") or {}).get(stem)
-    p = folder / "user" / f"{stem}.wav" if user and user.get("use") and not original else folder / f"{stem}.wav"
+    p = audiofile.path(folder / "user" if user and user.get("use") and not original else folder, stem)
     allowed = set(STEMS_6) | {x["id"] for x in meta.get("extras") or []}
     if stem not in allowed or not p.exists():
         raise HTTPException(404)
-    return FileResponse(p, media_type="audio/wav")
+    if p.suffix == ".flac" and wav:
+        info = sf.info(p)
+        buf = io.BytesIO()
+        with sf.SoundFile(p) as src, sf.SoundFile(buf, "w", info.samplerate, info.channels,
+                                                  subtype=info.subtype, format="WAV") as dst:
+            for block in src.blocks(SR * 30, dtype="int32", always_2d=True):
+                dst.write(block)
+        return Response(buf.getvalue(), media_type="audio/wav")
+    return FileResponse(p, media_type="audio/flac" if p.suffix == ".flac" else "audio/wav")
 
 
 # ---------------------------------------------------------------- 음정 뽑기 (MIDI)
@@ -696,13 +773,16 @@ def run_transcribe(job_id, song_id, stem, sound, snap):
         with work_lock:
             folder = song_folder(song_id)
             meta = json.loads((folder / "meta.json").read_text())
-            src = folder / "user" / f"{stem}.wav" if ((meta.get("replaced") or {}).get(stem) or {}).get("use") else folder / f"{stem}.wav"
+            mine = ((meta.get("replaced") or {}).get(stem) or {}).get("use")
             job.update(step="트랙 읽는 중", progress=0.0)
-            y, _ = sf.read(src, dtype="float32", always_2d=True)
+            y = audiofile.read(folder / "user" if mine else folder, stem)
             job["step"] = ("음 높이를 읽는 중" if stem in tr.MONO_STEMS else "화음을 읽는 중 (basic-pitch)")
-            raw = tr.transcribe(y, stem, lambda p: job.update(progress=0.05 + 0.75 * p))
+            curve = []
+            raw = tr.transcribe(y, stem, lambda p: job.update(progress=0.05 + 0.75 * p), curve=curve)
+            if curve:  # 편집 화면의 음높이 선 (한 번 읽은 김에)
+                save_pitch(folder, meta, stem, curve)
             job.update(step="조성과 빠르기 찾는 중", progress=0.85)
-            mix = sum(sf.read(folder / f"{n}.wav", dtype="float32", always_2d=True)[0] for n in meta["stems"])
+            mix = sum(audiofile.read(folder, n) for n in meta["stems"])
             tempo = tr.detect_tempo(mix)
             tonic, mode = tr.detect_key(raw)
             (folder / "midi").mkdir(exist_ok=True)
@@ -733,6 +813,84 @@ def transcribe_stem(song_id: str, stem: str = Form(...), sound: str = Form("pian
     job_id = uuid.uuid4().hex
     jobs[job_id] = {"status": "running", "step": "대기 중", "progress": 0.0}
     threading.Thread(target=run_transcribe, args=(job_id, song_id, stem, sound, bool(snap)), daemon=True).start()
+    return {"job_id": job_id}
+
+
+# ---------------------------------------------------------------- 원래 목소리의 음높이 선 (편집 화면 배경)
+def pitch_source(meta, stem):
+    """음높이 선이 어떤 소리에서 읽은 것인지: 원래 트랙, 또는 내 녹음(바꾸거나 싱크를 옮기면 다시 읽는다)."""
+    user = (meta.get("replaced") or {}).get(stem) or {}
+    if user.get("use"):
+        return f"user:{user.get('id') or user.get('name')}:{round(user.get('base', 0) + user.get('nudge', 0), 4)}"
+    return "stem"
+
+
+def pitch_file(folder, meta, stem):
+    # 원래 트랙과 내 녹음은 따로 둔다 (켜고 끌 때마다 다시 읽지 않게)
+    return folder / "pitch" / (f"{stem}.json" if pitch_source(meta, stem) == "stem" else f"{stem}.user.json")
+
+
+def save_pitch(folder, meta, stem, curve):
+    (folder / "pitch").mkdir(exist_ok=True)
+    tmp = folder / "pitch" / f".{stem}-{uuid.uuid4().hex[:8]}.tmp"
+    tmp.write_text(json.dumps({"hop": 0.01, "source": pitch_source(meta, stem), "midi": curve}))
+    os.replace(tmp, pitch_file(folder, meta, stem))
+
+
+@app.get("/api/songs/{song_id}/pitch/{stem}")
+def get_pitch(song_id: str, stem: str):
+    """10ms마다 음 높이 (MIDI, 소리 없으면 null). 아직 안 읽었거나 트랙이 바뀌었으면 404."""
+    folder = song_folder(song_id)
+    meta = json.loads((folder / "meta.json").read_text())
+    if stem not in meta["stems"]:
+        raise HTTPException(404, "그 트랙이 없어요")
+    p = pitch_file(folder, meta, stem)
+    if not p.exists():
+        raise HTTPException(404, "아직 음높이를 읽지 않았어요")
+    d = json.loads(p.read_text())
+    if d.get("source") != pitch_source(meta, stem):
+        raise HTTPException(404, "트랙이 바뀌어서 다시 읽어야 해요")
+    return {"hop": d["hop"], "midi": d["midi"]}
+
+
+def run_pitch(job_id, song_id, stem):
+    import transcribe as tr
+
+    job = jobs[job_id]
+    try:
+        with work_lock:
+            folder = song_folder(song_id)
+            meta = json.loads((folder / "meta.json").read_text())
+            p = pitch_file(folder, meta, stem)
+            if p.exists() and json.loads(p.read_text()).get("source") == pitch_source(meta, stem):
+                job.update(status="done", song_id=song_id, progress=1.0)  # 기다리는 사이에 다른 작업이 이미 읽었다
+                return
+            mine = ((meta.get("replaced") or {}).get(stem) or {}).get("use")
+            job.update(step="음 높이를 읽는 중", progress=0.0)
+            y = audiofile.read(folder / "user" if mine else folder, stem)
+            curve = tr.pitch_curve(y, stem, lambda p: job.update(progress=0.95 * p))
+            save_pitch(folder, meta, stem, curve)
+            job.update(status="done", song_id=song_id, progress=1.0)
+    except Exception as e:
+        traceback.print_exc()
+        job.update(status="error", error=f"음 높이를 읽지 못했어요: {str(e).splitlines()[0] if str(e) else type(e).__name__}")
+
+
+@app.post("/api/songs/{song_id}/pitch/{stem}")
+def start_pitch(song_id: str, stem: str):
+    """음높이 선을 (다시) 읽는다. 보컬 · 베이스처럼 한 음씩 나오는 트랙만."""
+    import transcribe as tr
+
+    meta = json.loads((song_folder(song_id) / "meta.json").read_text())
+    if stem not in meta["stems"] or stem not in tr.MONO_STEMS:
+        raise HTTPException(400, "보컬 · 베이스 트랙만 음높이 선을 그릴 수 있어요")
+    key = [song_id, stem, pitch_source(meta, stem)]
+    for jid, j in list(jobs.items()):  # 같은 소리를 이미 읽는 중(또는 차례를 기다리는 중)이면 그 작업을 알려 준다
+        if j.get("pitch") == key and j["status"] == "running":
+            return {"job_id": jid}
+    job_id = uuid.uuid4().hex
+    jobs[job_id] = {"status": "running", "step": "대기 중", "progress": 0.0, "pitch": key}
+    threading.Thread(target=run_pitch, args=(job_id, song_id, stem), daemon=True).start()
     return {"job_id": job_id}
 
 
@@ -781,13 +939,13 @@ def utau_export(song_id: str, stem: str = Form("vocals"), dest: str = Form(...),
     replaced = meta.get("replaced") or {}
 
     def active(n):
-        return folder / "user" / f"{n}.wav" if (replaced.get(n) or {}).get("use") else folder / f"{n}.wav"
+        return audiofile.read(folder / "user" if (replaced.get(n) or {}).get("use") else folder, n)
 
     rest = [n for n in meta["stems"] if n != stem]
-    backing = sum(sf.read(active(n), dtype="float32", always_2d=True)[0] for n in rest)
+    backing = sum(active(n) for n in rest)
     peak = float(np.abs(backing).max())
     sf.write(out / "backing.wav", backing / peak * 0.95 if peak > 0.95 else backing, SR, subtype="PCM_16")
-    guide, _ = sf.read(active(stem), dtype="float32", always_2d=True)
+    guide = active(stem)
     sf.write(out / f"guide_{stem}.wav", guide, SR, subtype="PCM_16")
     ms = len(backing) / SR * 1000
     n = tr.write_ustx(out / "project.ustx", notes, tempo, f"{label}",
@@ -796,10 +954,10 @@ def utau_export(song_id: str, stem: str = Form("vocals"), dest: str = Form(...),
     shutil.copyfile(folder / "midi" / f"{stem}.mid", out / "melody.mid")
     (out / "읽어 주세요.txt").write_text(
         f"{meta['title']} · {label}\n\n"
-        f"- project.ustx: OpenUtau로 열기. 첫 트랙에 원하는 가수(예: 重音テト)를 고르고 가사를 넣어 조율하세요.\n"
+        f"- project.ustx: OpenUtau로 열기. 첫 트랙에 원하는 가수(예: 重音テト)를 고르고 조율하세요.\n"
         f"  '반주' 트랙이 같이 들어 있어요. '원래 {label}' 트랙은 음소거돼 있으니 참고할 때 켜세요.\n"
         f"- project.ust: UTAU용 (같은 음표). melody.mid: 다른 보컬 신스용.\n"
-        f"- 빠르기 {tempo:g} BPM, 1마디 첫 박 = 곡 시작(0초). 음표 {n}개, 기본 가사 'ら'.\n"
+        f"- 빠르기 {tempo:g} BPM, 1마디 첫 박 = 곡 시작(0초). 음표 {n}개. 편집 화면에서 넣은 가사가 들어 있고, 가사 없는 음표는 'ら'.\n"
         f"- 다 되면 OpenUtau에서 보컬 트랙을 wav로 내보내고(처음부터), StemMixer의 {label} 트랙에 끌어다 놓으세요.\n"
         f"  0초부터 시작하는 wav면 싱크가 그대로 맞아요.\n", encoding="utf-8")
     return {"folder": str(out), "notes": n, "tempo": tempo}
@@ -844,7 +1002,7 @@ def song_tempo(song_id: str):
     folder = song_folder(song_id)
     meta = json.loads((folder / "meta.json").read_text())
     if not meta.get("tempo"):
-        mix = sum(sf.read(folder / f"{n}.wav", dtype="float32", always_2d=True)[0] for n in meta["stems"])
+        mix = sum(audiofile.read(folder, n) for n in meta["stems"])
         meta["tempo"] = round(tr.detect_tempo(mix), 2)
         save_meta(folder, meta)
     return {"tempo": meta["tempo"]}
@@ -870,7 +1028,7 @@ def save_notes(song_id: str, stem: str, notes: str = Form(...), tempo: float = F
     data = json.loads(p.read_text()) if p.exists() else None
     if data is None:  # AI로 뽑은 적 없는 트랙: 이 음표가 곧 원본
         if not tempo and not meta.get("tempo"):
-            mix = sum(sf.read(folder / f"{n}.wav", dtype="float32", always_2d=True)[0] for n in meta["stems"])
+            mix = sum(audiofile.read(folder, n) for n in meta["stems"])
             meta["tempo"] = round(tr.detect_tempo(mix), 2)
         data = {"raw": clean, "imported": True, "tempo": float(tempo or meta["tempo"])}
     elif tempo:
@@ -925,8 +1083,9 @@ def delete_midi(song_id: str, stem: str):
     if stem not in meta["stems"]:  # "*" 같은 이름으로 다른 파일까지 지우지 않게
         raise HTTPException(400, "그 트랙이 없어요")
     meta["extras"] = [x for x in meta.get("extras") or [] if x["source"] != stem]
-    for f in [folder / f"{stem}_midi.wav", *(folder / "midi").glob(f"{stem}.*")] if (folder / "midi").exists() else []:
-        Path(f).unlink(missing_ok=True)
+    audiofile.remove(folder, f"{stem}_midi")
+    for f in (folder / "midi").glob(f"{stem}.*") if (folder / "midi").exists() else []:
+        f.unlink(missing_ok=True)
     save_meta(folder, meta)
     return meta
 
@@ -943,11 +1102,11 @@ def render_user_track(folder, stem, offset):
     """보관한 내 파일을 곡과 같은 형식·길이로 바꾼다. offset(초)만큼 늦게 (음수면 앞을 잘라) 시작."""
     src = next((folder / "user").glob(f"{stem}.src.*"))
     y = decode(src)
-    n = sf.info(folder / f"{stem}.wav").frames
+    n = audiofile.frames(folder, stem)
     shift = int(round(offset * SR))
     y = np.concatenate([np.zeros((shift, 2), np.float32), y]) if shift > 0 else y[-shift:]
     y = y[:n] if len(y) >= n else np.concatenate([y, np.zeros((n - len(y), 2), np.float32)])
-    sf.write(folder / "user" / f"{stem}.wav", np.clip(y, -1, 1), SR, subtype="PCM_24")
+    audiofile.write(folder / "user", stem, np.clip(y, -1, 1))
 
 
 @app.post("/api/songs/{song_id}/user-track")
@@ -969,7 +1128,9 @@ def set_user_track(song_id: str, stem: str = Form(...), path: str = Form(None), 
         for old in (folder / "user").glob(f"{stem}.src.*"):
             old.unlink()
         shutil.copyfile(f, folder / "user" / f"{stem}.src{f.suffix.lower() or '.wav'}")
-        cur = {"name": name or f.stem, "base": 0.0, "nudge": 0.0, "use": True}
+        # id: 같은 이름의 파일을 다시 넣어도 새 소리로 알아보게 (음높이 선 다시 읽기)
+        cur = {"name": name or f.stem, "base": 0.0, "nudge": 0.0, "use": True, "id": uuid.uuid4().hex[:8]}
+        (folder / "pitch" / f"{stem}.user.json").unlink(missing_ok=True)
     elif stem not in replaced:
         raise HTTPException(400, "먼저 파일을 넣어 주세요")
     if base is not None:
@@ -998,6 +1159,7 @@ def remove_user_track(song_id: str, stem: str):
     (meta.get("replaced") or {}).pop(stem, None)
     for f in (folder / "user").glob(f"{stem}.*") if (folder / "user").exists() else []:
         f.unlink()
+    (folder / "pitch" / f"{stem}.user.json").unlink(missing_ok=True)
     save_meta(folder, meta)
     return meta
 

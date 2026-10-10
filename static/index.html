@@ -309,7 +309,7 @@ async function openSong(id) {
     row.querySelector("input").oninput = e => { tracks[n].vol = +e.target.value; applyGains(); };
     row.querySelector("input").ondblclick = () => { tracks[n].vol = 100; applyGains(); };
     const dl = row.querySelector(".dl");
-    dl.href = `/api/songs/${id}/${n}.wav`;
+    dl.href = `/api/songs/${id}/${n}.wav?wav=1`;  // 저장은 FLAC이라도 받을 때는 wav로
     dl.download = `${song.title} - ${info.label}.wav`;
     row.querySelector(".m").onclick = () => { tracks[n].mute = !tracks[n].mute; applyGains(); };
     row.querySelector(".s").onclick = () => { tracks[n].solo = !tracks[n].solo; applyGains(); };
