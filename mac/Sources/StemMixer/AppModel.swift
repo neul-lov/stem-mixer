@@ -224,6 +224,16 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Separates the song again with the same mode, so it gets the latest quality improvements.
+    /// Your own recordings and MIDI tracks on it are kept.
+    func redo(_ item: Song) {
+        guard server == .ready, job == nil else { return }
+        if song?.id == item.id { pause() }
+        run(label: "\(item.title) → \(SplitMode.label(item.mode)) 다시") {
+            try await self.backend.resplit(item.id, mode: item.mode)
+        }
+    }
+
     func chooseFile() {
         let panel = NSOpenPanel()
         panel.allowedContentTypes = [.audio, .movie]

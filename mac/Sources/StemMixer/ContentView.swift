@@ -368,6 +368,11 @@ struct ResplitItems: View {
     @ObservedObject var model: AppModel
 
     var body: some View {
+        if item.mode == "hq" || item.mode == "hq6" {
+            Button("같은 방식으로 다시 분리 (최신 품질)") { model.redo(item) }
+                .disabled(model.job != nil)
+            Divider()
+        }
         ForEach(SplitMode.picker.filter { $0.rawValue != item.mode }) { mode in
             Button(model.version(of: item, mode: mode) == nil ? "\(mode.title)으로 다시 분리" : "\(mode.title) 버전 열기") {
                 model.resplit(item, mode: mode)

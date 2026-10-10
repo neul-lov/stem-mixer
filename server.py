@@ -312,9 +312,15 @@ def separate_hq(x, job, six=False):
     """최고 품질: 보컬은 RoFormer, 반주(원곡 - 보컬)는 모델마다 잘하는 악기만 가져온다.
     MUSDB18 테스트로 잰 결과 드럼은 htdemucs_6s, 베이스는 htdemucs_ft가 가장 좋았다.
     나머지 악기 = 반주 - (가져온 악기들) 이라서 트랙을 다 더하면 원곡과 같다."""
-    vocals = roformer_vocals(x, job, 0.0, 0.5)
+    vocals = roformer_vocals(x, job, 0.0, 0.3)
     inst = x - vocals
-    ft = demucs_split(inst, job, "htdemucs_ft", 0.5, 0.85, "베이스를 나누는 중")
+    # 화음 · 더블링 · 효과가 많이 걸린 보컬은 한 번에 다 안 빠지고 "나머지 악기"에 남는다
+    # (실제 곡에서 나머지 악기 안 목소리가 보컬 대비 -12 dB). 남은 소리에서 한 번 더 뽑아 보컬로 옮긴다.
+    job["step"] = "남은 목소리를 한 번 더 뽑는 중"
+    extra = roformer_vocals(inst, job, 0.3, 0.55)
+    job["step"] = "남은 목소리를 한 번 더 뽑는 중"
+    vocals, inst = vocals + extra, inst - extra
+    ft = demucs_split(inst, job, "htdemucs_ft", 0.55, 0.85, "베이스를 나누는 중")
     s6 = demucs_split(inst, job, "htdemucs_6s", 0.85, 1.0, "드럼 · 기타 · 피아노를 나누는 중")
     out = {"vocals": vocals, "drums": s6["drums"], "bass": ft["bass"]}
     if six:
@@ -363,6 +369,7 @@ def run_job(job_id, mode, text=None, upload_path=None, title=None, resplit=None)
     try:
         with work_lock:
             source, matched, link = "file", None, None
+            redo = bool(resplit) and resplit.rsplit("-", 1)[1] == mode  # 같은 방식으로 다시 (새 품질 반영)
             if resplit:  # 라이브러리에 있는 곡을 다른 방식으로 다시 분리
                 old = json.loads((LIBRARY / resplit / "meta.json").read_text())
                 key = resplit.rsplit("-", 1)[0]
@@ -375,7 +382,7 @@ def run_job(job_id, mode, text=None, upload_path=None, title=None, resplit=None)
                 key = hashlib.sha1(upload_path.read_bytes()).hexdigest()[:11]
             song_id = f"{key}-{mode}"
             folder = LIBRARY / song_id
-            if (folder / "meta.json").exists():  # 이미 분리한 곡이면 바로 열기
+            if (folder / "meta.json").exists() and not redo:  # 이미 분리한 곡이면 바로 열기
                 if upload_path:
                     upload_path.unlink(missing_ok=True)
                 (folder / "meta.json").touch()
@@ -421,6 +428,10 @@ def run_job(job_id, mode, text=None, upload_path=None, title=None, resplit=None)
             meta = {"id": song_id, "title": title, "mode": mode, "duration": len(x) / SR,
                     "stems": names, "source": source, "matched": matched, "link": link,
                     "input": text}
+            if redo:  # 내 녹음 · MIDI 트랙은 그대로 둔다
+                for k in ("replaced", "extras"):
+                    if old.get(k):
+                        meta[k] = old[k]
             (folder / "meta.json").write_text(json.dumps(meta, ensure_ascii=False))
             job.update(status="done", song_id=song_id, progress=1.0)
     except Exception as e:
