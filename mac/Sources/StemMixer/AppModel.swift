@@ -1,4 +1,5 @@
 import AppKit
+import AVFoundation
 import Carbon
 import MediaPlayer
 import SwiftUI
@@ -277,7 +278,7 @@ final class AppModel: ObservableObject {
         let saved = UserDefaults.standard.dictionary(forKey: "mix.\(meta.id)") as? [String: Int] ?? [:]
         tracks = Dictionary(uniqueKeysWithValues: meta.stems.map { ($0, TrackState(volume: saved[$0] ?? 100)) })
         do {
-            try mixer.load(meta.stems.map { ($0, backend.stemURL(song: meta.id, stem: $0)) })
+            try mixer.load(meta.stems.map { ($0, backend.activeStemURL(meta, $0)) })
             applyGains()
             time = 0
         } catch {
@@ -315,6 +316,7 @@ final class AppModel: ObservableObject {
     func togglePlay() {
         guard song != nil else { return }
         leaveTextField()
+        if recordingStem != nil { return stopRecording() }
         if mixer.isPlaying { pause() } else {
             mixer.play()
             playing = true
@@ -343,6 +345,10 @@ final class AppModel: ObservableObject {
         }
         time = mixer.currentTime
         if time >= mixer.duration - 0.02 {
+            if recordingStem != nil {
+                stopRecording()
+                return
+            }
             pause()
             seek(0)
         }
@@ -390,7 +396,7 @@ final class AppModel: ObservableObject {
     // MARK: Mix
 
     func audible(_ name: String) -> Bool {
-        guard let t = tracks[name] else { return false }
+        guard let t = tracks[name], recordingStem != name else { return false }
         let anySolo = tracks.values.contains { $0.solo }
         return !t.muted && (!anySolo || t.solo)
     }
@@ -440,7 +446,7 @@ final class AppModel: ObservableObject {
         panel.nameFieldStringValue = "\(song.title)_\(desc).wav".replacingOccurrences(of: "/", with: "-")
         panel.directoryURL = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        let inputs = song.stems.map { (backend.stemURL(song: song.id, stem: $0), audible($0) ? Double(tracks[$0]!.volume) / 100 : 0) }
+        let inputs = song.stems.map { (backend.activeStemURL(song, $0), audible($0) ? Double(tracks[$0]!.volume) / 100 : 0) }
         exporting = true
         Task.detached {
             let result = Result { try Mixer.export(inputs, to: url) }
@@ -451,6 +457,159 @@ final class AppModel: ObservableObject {
                 case .failure: self.show("저장하지 못했어요", success: false)
                 }
             }
+        }
+    }
+
+    // MARK: Your own tracks
+
+    @Published var recordingStem: String?
+    @Published var countdown: Int?
+    @Published var recordStart: Double = 0
+    @Published var busyStem: String?
+    private let recorder = Recorder()
+
+    /// Reloads the open song after its files changed, keeping the playhead.
+    private func reload(_ meta: Song) {
+        let at = mixer.currentTime, wasPlaying = mixer.isPlaying
+        if let i = songs.firstIndex(where: { $0.id == meta.id }) { songs[i] = meta }
+        let keep = tracks
+        load(meta)
+        for (k, v) in keep where tracks[k] != nil { tracks[k] = v }
+        applyGains()
+        seek(at)
+        if wasPlaying { togglePlay() }
+    }
+
+    private func updateUserTrack(_ stem: String, _ label: String,
+                                 _ call: @escaping () async throws -> Song) {
+        guard song != nil else { return }
+        busyStem = stem
+        Task {
+            do {
+                let meta = try await call()
+                if song?.id == meta.id { reload(meta) }
+                if !label.isEmpty { show(label) }
+            } catch {
+                show(error.localizedDescription, success: false)
+            }
+            busyStem = nil
+        }
+    }
+
+    func replace(_ stem: String, with file: URL) {
+        guard let song else { return }
+        updateUserTrack(stem, "\(StemInfo.of(stem).label)을 내 파일로 바꿨어요") {
+            try await self.backend.setUserTrack(song.id, stem: stem, file: file, name: file.deletingPathExtension().lastPathComponent)
+        }
+    }
+
+    func chooseReplacement(for stem: String) {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.audio]
+        panel.message = "\(StemInfo.of(stem).label) 대신 넣을 오디오 파일을 고르세요"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        replace(stem, with: url)
+    }
+
+    func setNudge(_ stem: String, _ seconds: Double) {
+        guard let song else { return }
+        updateUserTrack(stem, "") { try await self.backend.setUserTrack(song.id, stem: stem, nudge: seconds) }
+    }
+
+    func setUseMine(_ stem: String, _ use: Bool) {
+        guard let song else { return }
+        updateUserTrack(stem, use ? "내 트랙으로 들어요" : "원래 트랙으로 들어요") {
+            try await self.backend.setUserTrack(song.id, stem: stem, use: use)
+        }
+    }
+
+    func removeMine(_ stem: String) {
+        guard let song else { return }
+        updateUserTrack(stem, "원래 트랙으로 되돌렸어요") { try await self.backend.removeUserTrack(song.id, stem: stem) }
+    }
+
+    /// Plays the song with this track muted and records the microphone in sync, after a 3-second count-in.
+    func startRecording(_ stem: String) {
+        guard song != nil, recordingStem == nil else { return }
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized:
+            beginRecording(stem)
+        case .notDetermined:
+            AVCaptureDevice.requestAccess(for: .audio) { granted in
+                Task { @MainActor in granted ? self.beginRecording(stem) : self.micDenied() }
+            }
+        default:
+            micDenied()
+        }
+    }
+
+    private func micDenied() {
+        let alert = NSAlert()
+        alert.messageText = "마이크를 쓸 수 없어요"
+        alert.informativeText = "시스템 설정 → 개인정보 보호 및 보안 → 마이크에서 StemMixer를 켜 주세요."
+        alert.addButton(withTitle: "설정 열기")
+        alert.addButton(withTitle: "닫기")
+        if alert.runModal() == .alertFirstButtonReturn,
+           let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    private var recordingURL: URL {
+        FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("StemMixer/recording.caf")
+    }
+
+    private func beginRecording(_ stem: String) {
+        guard let song else { return }
+        if mixer.isPlaying { pause() }
+        leaveTextField()
+        do {
+            try FileManager.default.createDirectory(at: recordingURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try recorder.start(to: recordingURL)
+        } catch {
+            show("녹음을 시작하지 못했어요", success: false)
+            return
+        }
+        recordingStem = stem
+        recordStart = mixer.currentTime
+        applyGains()  // mutes the track being recorded
+        mixer.play(after: 3)
+        playing = true
+        countdown = 3
+        Task {
+            for n in [2, 1] {
+                try? await Task.sleep(for: .seconds(1))
+                guard recordingStem != nil else { return }
+                countdown = n
+            }
+            try? await Task.sleep(for: .seconds(1))
+            countdown = nil
+        }
+        _ = song
+    }
+
+    /// Stops and puts the take in place of the track (or throws it away).
+    func stopRecording(keep: Bool = true) {
+        guard let stem = recordingStem, let song else { return }
+        mixer.pause()
+        playing = false
+        recorder.stop()
+        recordingStem = nil
+        countdown = nil
+        applyGains()
+        guard keep, let first = recorder.firstHostTime else {
+            if keep { show("녹음된 소리가 없어요", success: false) }
+            return
+        }
+        // Song time of the first recorded sample: where playback started, plus how long after the
+        // song started the mic began, minus the time sound spends in the speakers and the mic.
+        let lead = AVAudioTime.seconds(forHostTime: first) - AVAudioTime.seconds(forHostTime: mixer.startHostTime)
+        let base = recordStart + lead - recorder.inputLatency - mixer.outputLatency
+        let stamp = Date().formatted(.dateTime.month().day().hour().minute())
+        let url = recordingURL
+        updateUserTrack(stem, "녹음을 \(StemInfo.of(stem).label) 자리에 넣었어요") {
+            try await self.backend.setUserTrack(song.id, stem: stem, file: url, name: "내 녹음 \(stamp)", base: base)
         }
     }
 
@@ -468,12 +627,13 @@ final class AppModel: ObservableObject {
     /// The stem file under a readable name ("곡 제목 - 보컬.wav"), so editing apps name the track sensibly.
     func namedStem(_ stem: String, of song: Song) -> URL? {
         let dir = exportCache.appendingPathComponent(song.id, isDirectory: true)
-        let url = dir.appendingPathComponent("\(safeName(song.title)) - \(StemInfo.of(stem).label).wav")
+        let mine = song.replaced?[stem]?.use == true ? " (내 녹음)" : ""
+        let url = dir.appendingPathComponent("\(safeName(song.title)) - \(StemInfo.of(stem).label)\(mine).wav")
         let fm = FileManager.default
-        if fm.fileExists(atPath: url.path) { return url }
+        try? fm.removeItem(at: url)  // the track may have been re-recorded since
         do {
             try fm.createDirectory(at: dir, withIntermediateDirectories: true)
-            let source = backend.stemURL(song: song.id, stem: stem)
+            let source = backend.activeStemURL(song, stem)
             // A hard link costs no space; fall back to a copy on another volume.
             do { try fm.linkItem(at: source, to: url) } catch { try fm.copyItem(at: source, to: url) }
             return url
@@ -514,7 +674,8 @@ final class AppModel: ObservableObject {
     /// Identifies the current mix, so a rendered file is reused until a slider changes.
     var mixSignature: String {
         guard let song else { return "" }
-        return song.id + song.stems.map { "\($0)\(audible($0) ? tracks[$0]!.volume : 0)" }.joined()
+        let user = song.replaced.map { r in r.keys.sorted().map { "\($0)\(r[$0]!.use)\(r[$0]!.nudge)\(r[$0]!.base)\(r[$0]!.name ?? "")" }.joined() } ?? ""
+        return song.id + user + song.stems.map { "\($0)\(audible($0) ? tracks[$0]!.volume : 0)" }.joined()
     }
 
     @Published var renderedMix: (signature: String, url: URL)?
@@ -534,7 +695,7 @@ final class AppModel: ObservableObject {
         let desc = song.stems.map { "\(StemInfo.of($0).label)\(audible($0) ? tracks[$0]!.volume : 0)" }.joined(separator: " ")
         let dir = exportCache.appendingPathComponent(song.id, isDirectory: true)
         let url = dir.appendingPathComponent("\(safeName(song.title)) - 믹스 (\(desc)).wav")
-        let inputs = song.stems.map { (backend.stemURL(song: song.id, stem: $0), audible($0) ? Double(tracks[$0]!.volume) / 100 : 0) }
+        let inputs = song.stems.map { (backend.activeStemURL(song, $0), audible($0) ? Double(tracks[$0]!.volume) / 100 : 0) }
         renderingMix = true
         Task.detached {
             let result = Result {
@@ -578,7 +739,7 @@ final class AppModel: ObservableObject {
             for stem in song.stems {
                 let target = dir.appendingPathComponent("\(safeName(song.title)) - \(StemInfo.of(stem).label).wav")
                 try? FileManager.default.removeItem(at: target)
-                try FileManager.default.copyItem(at: backend.stemURL(song: song.id, stem: stem), to: target)
+                try FileManager.default.copyItem(at: backend.activeStemURL(song, stem), to: target)
             }
             NSWorkspace.shared.activateFileViewerSelecting([dir])
             show("트랙 \(song.stems.count)개를 저장했어요")
@@ -633,6 +794,10 @@ final class AppModel: ObservableObject {
             input = text.trimmingCharacters(in: .whitespacesAndNewlines)
             focusToken += 1
             return true
+        }
+        if recordingStem != nil, flags.isEmpty {
+            if event.keyCode == UInt16(kVK_Space) { stopRecording(); return true }
+            if event.keyCode == UInt16(kVK_Escape) { stopRecording(keep: false); return true }
         }
         guard !typing, flags.subtracting([.numericPad, .function]).isEmpty, song != nil else { return false }
         switch Int(event.keyCode) {

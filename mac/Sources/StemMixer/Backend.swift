@@ -1,5 +1,16 @@
 import Foundation
 
+/// A track replaced by the user's own file or recording.
+struct UserTrack: Codable, Equatable {
+    var name: String?
+    /// Where the recording starts in the song (seconds); 0 for an imported file.
+    var base: Double
+    /// Manual sync adjustment in seconds (−2 … +2).
+    var nudge: Double
+    /// false = play the original track for comparison.
+    var use: Bool
+}
+
 struct Song: Codable, Identifiable, Equatable {
     let id: String
     let title: String
@@ -10,6 +21,7 @@ struct Song: Codable, Identifiable, Equatable {
     var matched: String?
     var link: String?
     var input: String?
+    var replaced: [String: UserTrack]?
 
     /// The part of the id shared by every mode's version of this song.
     var key: String { String(id[..<(id.lastIndex(of: "-") ?? id.endIndex)]) }
@@ -41,6 +53,7 @@ final class Backend {
     let folder: URL
     private var process: Process?
     private let base = URL(string: "http://127.0.0.1:\(Backend.port)")!
+    private var base_: URL { base }
 
     init() {
         let configured = Bundle.main.object(forInfoDictionaryKey: "StemMixerBackend") as? String
@@ -53,6 +66,45 @@ final class Backend {
 
     func stemURL(song: String, stem: String) -> URL {
         library.appendingPathComponent(song).appendingPathComponent("\(stem).wav")
+    }
+
+    func userStemURL(song: String, stem: String) -> URL {
+        library.appendingPathComponent(song).appendingPathComponent("user/\(stem).wav")
+    }
+
+    /// The file that should play for a stem: the user's version when it's switched on.
+    func activeStemURL(_ song: Song, _ stem: String) -> URL {
+        song.replaced?[stem]?.use == true ? userStemURL(song: song.id, stem: stem) : stemURL(song: song.id, stem: stem)
+    }
+
+    /// Replaces a stem with a file, or changes the sync / on-off of an existing replacement.
+    func setUserTrack(_ songID: String, stem: String, file: URL? = nil, name: String? = nil,
+                      base: Double? = nil, nudge: Double? = nil, use: Bool? = nil) async throws -> Song {
+        var form = URLComponents()
+        var items = [URLQueryItem(name: "stem", value: stem)]
+        if let file { items.append(URLQueryItem(name: "path", value: file.path)) }
+        if let name { items.append(URLQueryItem(name: "name", value: name)) }
+        if let base { items.append(URLQueryItem(name: "base", value: String(base))) }
+        if let nudge { items.append(URLQueryItem(name: "nudge", value: String(nudge))) }
+        if let use { items.append(URLQueryItem(name: "use", value: use ? "1" : "0")) }
+        form.queryItems = items
+        var req = URLRequest(url: base_.appendingPathComponent("api/songs/\(songID)/user-track"))
+        req.httpMethod = "POST"
+        req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        req.httpBody = form.percentEncodedQuery?.replacingOccurrences(of: "+", with: "%2B").data(using: .utf8)
+        let (data, response) = try await URLSession.shared.data(for: req)
+        guard (response as? HTTPURLResponse)?.statusCode == 200 else {
+            let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+            throw BackendError(message: json?["detail"] as? String ?? "바꾸지 못했어요")
+        }
+        return try JSONDecoder().decode(Song.self, from: data)
+    }
+
+    func removeUserTrack(_ songID: String, stem: String) async throws -> Song {
+        var req = URLRequest(url: base_.appendingPathComponent("api/songs/\(songID)/user-track/\(stem)"))
+        req.httpMethod = "DELETE"
+        let (data, _) = try await URLSession.shared.data(for: req)
+        return try JSONDecoder().decode(Song.self, from: data)
     }
 
     var isInstalled: Bool {

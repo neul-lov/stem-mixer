@@ -30,6 +30,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>LSApplicationCategoryType</key><string>public.app-category.music</string>
     <key>NSHighResolutionCapable</key><true/>
     <key>StemMixerBackend</key><string>$BACKEND</string>
+    <key>NSMicrophoneUsageDescription</key><string>내 목소리나 악기를 녹음해서 트랙 대신 넣을 때 마이크를 써요.</string>
 </dict>
 </plist>
 PLIST

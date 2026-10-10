@@ -12,6 +12,7 @@ struct PlayerView: View {
                         titleBlock(song)
                         transport
                         presets
+                        if let stem = model.recordingStem { RecordingBar(stem: stem, model: model) }
                         VStack(spacing: 6) {
                             ForEach(song.stems, id: \.self) { TrackRow(name: $0, model: model) }
                         }
@@ -214,6 +215,8 @@ struct TrackRow: View {
     let name: String
     @ObservedObject var model: AppModel
     @State private var hovering = false
+    @State private var dropping = false
+    @State private var showMine = false
 
     var body: some View {
         let info = StemInfo.of(name)
@@ -231,13 +234,35 @@ struct TrackRow: View {
             .help("끌어서 편집 앱이나 Finder에 놓기")
             .padding(.trailing, -6)
 
-            HStack(spacing: 8) {
-                Circle()
-                    .fill(info.color.gradient)
-                    .frame(width: 10, height: 10)
-                    .shadow(color: info.color.opacity(0.5), radius: 3)
-                Text(info.label)
-                    .font(.system(size: 13, weight: .semibold))
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 8) {
+                    Circle()
+                        .fill(info.color.gradient)
+                        .frame(width: 10, height: 10)
+                        .shadow(color: info.color.opacity(0.5), radius: 3)
+                    Text(info.label)
+                        .font(.system(size: 13, weight: .semibold))
+                    if model.busyStem == name { ProgressView().controlSize(.mini) }
+                }
+                if let mine = model.song?.replaced?[name] {
+                    Button { showMine.toggle() } label: {
+                        HStack(spacing: 3) {
+                            Image(systemName: mine.use ? "person.wave.2.fill" : "arrow.uturn.backward")
+                            Text(mine.use ? "내 녹음" : "원래 트랙")
+                        }
+                        .font(.system(size: 9.5, weight: .bold))
+                        .foregroundStyle(mine.use ? .white : Color.accentColor)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Capsule().fill(mine.use ? AnyShapeStyle(Color.accentColor.gradient)
+                                                            : AnyShapeStyle(Color.accentColor.opacity(0.14))))
+                    }
+                    .buttonStyle(PressableStyle())
+                    .help("내 트랙 설정 (원래 트랙과 비교, 싱크 맞추기)")
+                    .popover(isPresented: $showMine, arrowEdge: .bottom) {
+                        MineSettings(stem: name, track: mine, model: model)
+                    }
+                }
             }
             .frame(width: 92, alignment: .leading)
 
@@ -289,7 +314,35 @@ struct TrackRow: View {
         )
         .opacity(audible ? 1 : 0.45)
         .animation(.easeOut(duration: 0.15), value: audible)
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .strokeBorder(Color.accentColor.opacity(dropping ? 0.8 : 0), style: StrokeStyle(lineWidth: 2, dash: [6, 4]))
+        )
+        .overlay {
+            if dropping {
+                Text("놓으면 \(info.label)을 이 파일로 바꿔요")
+                    .font(.system(size: 12, weight: .bold))
+                    .foregroundStyle(Color.accentColor)
+                    .padding(.horizontal, 10).padding(.vertical, 4)
+                    .background(Capsule().fill(.regularMaterial))
+            }
+        }
+        .onDrop(of: [.fileURL], isTargeted: $dropping) { providers in
+            guard let provider = providers.first else { return false }
+            _ = provider.loadObject(ofClass: URL.self) { url, _ in
+                guard let url else { return }
+                Task { @MainActor in model.replace(name, with: url) }
+            }
+            return true
+        }
         .contextMenu {
+            Button("내 파일로 바꾸기…") { model.chooseReplacement(for: name) }
+            Button("여기에 녹음하기 (헤드폰 추천)") { model.startRecording(name) }
+            if let mine = model.song?.replaced?[name] {
+                Button(mine.use ? "원래 트랙으로 듣기" : "내 트랙으로 듣기") { model.setUseMine(name, !mine.use) }
+                Button("내 트랙 지우기", role: .destructive) { model.removeMine(name) }
+            }
+            Divider()
             Button("트랙 파일 복사") { model.copyStem(name) }
             Button("Finder에서 보기") { model.revealStem(name) }
             Divider()
@@ -373,5 +426,120 @@ struct SendToApps: View {
         .background(Capsule().fill(tint == .secondary ? Color.primary.opacity(0.06) : tint.opacity(0.14)))
         .overlay(Capsule().strokeBorder(tint == .secondary ? .clear : tint.opacity(0.35), lineWidth: 1))
         .contentShape(Capsule())
+    }
+}
+
+/// Settings for a track replaced by your own file or recording.
+struct MineSettings: View {
+    let stem: String
+    let track: UserTrack
+    @ObservedObject var model: AppModel
+    @State private var nudgeMs: Double = 0
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                Image(systemName: "person.wave.2.fill").foregroundStyle(Color.accentColor)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("\(StemInfo.of(stem).label) · 내 트랙").font(.system(size: 13, weight: .bold))
+                    Text(track.name ?? "").font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary).lineLimit(1)
+                }
+            }
+            Picker("", selection: Binding(get: { track.use }, set: { model.setUseMine(stem, $0) })) {
+                Text("원래 트랙").tag(false)
+                Text("내 트랙").tag(true)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Text("싱크 맞추기").font(.system(size: 11, weight: .bold)).foregroundStyle(.secondary)
+                    Spacer()
+                    Text(String(format: "%+.0f ms", nudgeMs))
+                        .font(.system(size: 12, weight: .bold)).monospacedDigit()
+                }
+                CapsuleSlider(value: $nudgeMs, range: -500...500, mark: 0,
+                              onCommit: { model.setNudge(stem, ($0 / 1000 * 1000).rounded() / 1000) },
+                              onDoubleClick: { nudgeMs = 0; model.setNudge(stem, 0) })
+                HStack(spacing: 6) {
+                    ForEach([-50, -10, 10, 50], id: \.self) { step in
+                        Button(step > 0 ? "+\(step)" : "\(step)") {
+                            nudgeMs = max(-500, min(500, nudgeMs + Double(step)))
+                            model.setNudge(stem, nudgeMs / 1000)
+                        }
+                        .font(.system(size: 11, weight: .semibold))
+                    }
+                    Spacer()
+                    Button("0") { nudgeMs = 0; model.setNudge(stem, 0) }.font(.system(size: 11, weight: .semibold))
+                }
+                Text("−는 내 트랙을 앞으로, +는 뒤로 밀어요.")
+                    .font(.system(size: 10.5)).foregroundStyle(.secondary)
+            }
+            .disabled(!track.use)
+            .opacity(track.use ? 1 : 0.5)
+
+            Divider()
+            HStack {
+                Button("다시 녹음") { model.startRecording(stem) }
+                Button("다른 파일…") { model.chooseReplacement(for: stem) }
+                Spacer()
+                Button("지우기", role: .destructive) { model.removeMine(stem) }
+            }
+            .font(.system(size: 12, weight: .semibold))
+        }
+        .padding(14)
+        .frame(width: 300)
+        .fontDesign(.rounded)
+        .onAppear { nudgeMs = (track.nudge * 1000).rounded() }
+    }
+}
+
+/// Shown while recording: count-in, elapsed time, stop / cancel.
+struct RecordingBar: View {
+    let stem: String
+    @ObservedObject var model: AppModel
+    @State private var pulse = false
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Circle()
+                .fill(Color.red.gradient)
+                .frame(width: 12, height: 12)
+                .opacity(pulse ? 0.35 : 1)
+                .animation(.easeInOut(duration: 0.6).repeatForever(autoreverses: true), value: pulse)
+                .onAppear { pulse = true }
+            VStack(alignment: .leading, spacing: 1) {
+                if let n = model.countdown {
+                    Text("\(n)…  곧 시작해요").font(.system(size: 13, weight: .bold)).contentTransition(.numericText())
+                } else {
+                    Text("\(StemInfo.of(stem).label) 녹음 중 · \(formatTime(max(0, model.time - model.recordStart)))")
+                        .font(.system(size: 13, weight: .bold)).monospacedDigit()
+                }
+                Text("헤드폰을 끼면 스피커 소리가 녹음에 안 섞여요 · Space 정지 · esc 취소")
+                    .font(.system(size: 10.5, weight: .medium)).foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button("취소") { model.stopRecording(keep: false) }
+                .buttonStyle(.plain)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(.secondary)
+            Button { model.stopRecording() } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "stop.fill")
+                    Text("정지하고 넣기")
+                }
+                .font(.system(size: 12.5, weight: .bold))
+                .foregroundStyle(.white)
+                .padding(.horizontal, 14).padding(.vertical, 7)
+                .background(Capsule().fill(Color.red.gradient))
+                .shadow(color: .red.opacity(0.35), radius: 6, y: 2)
+            }
+            .buttonStyle(PressableStyle())
+        }
+        .padding(12)
+        .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(Color.red.opacity(0.08)))
+        .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(Color.red.opacity(0.3), lineWidth: 1))
+        .transition(.move(edge: .top).combined(with: .opacity))
     }
 }

@@ -71,7 +71,12 @@ final class Mixer {
         levelLock.withLock { levels = [:] }
     }
 
-    func play() {
+    /// Host time at which the last play() started (for lining up recordings).
+    private(set) var startHostTime: UInt64 = 0
+    var outputLatency: Double { engine.outputNode.presentationLatency }
+    var startSeconds: Double { Double(startFrame) / sampleRate }
+
+    func play(after delay: Double = 0.05) {
         guard !tracks.isEmpty else { return }
         if !engine.isRunning { try? engine.start() }
         if startFrame >= length - 1024 { startFrame = 0 }
@@ -81,7 +86,8 @@ final class Mixer {
             track.player.prepare(withFrameCount: 8192)
         }
         // Start every stem on the same host time so they stay sample-aligned.
-        let start = AVAudioTime(hostTime: mach_absolute_time() + AVAudioTime.hostTime(forSeconds: 0.05))
+        startHostTime = mach_absolute_time() + AVAudioTime.hostTime(forSeconds: delay)
+        let start = AVAudioTime(hostTime: startHostTime)
         for track in tracks.values { track.player.play(at: start) }
         isPlaying = true
     }
@@ -176,5 +182,46 @@ final class Mixer {
             try out.write(from: mix)
             done += AVAudioFramePosition(n)
         }
+    }
+}
+
+/// Records the microphone on its own engine, noting when the first sample arrived
+/// so the take can be lined up with the song afterwards.
+final class Recorder {
+    private let engine = AVAudioEngine()
+    private var file: AVAudioFile?
+    private let lock = NSLock()
+    private var firstHost: UInt64?
+    private(set) var url: URL?
+
+    var inputLatency: Double { engine.inputNode.presentationLatency }
+    var firstHostTime: UInt64? { lock.withLock { firstHost } }
+
+    func start(to url: URL) throws {
+        let input = engine.inputNode
+        let format = input.outputFormat(forBus: 0)
+        guard format.channelCount > 0, format.sampleRate > 0 else {
+            throw BackendError(message: "마이크를 찾지 못했어요")
+        }
+        try? FileManager.default.removeItem(at: url)
+        file = try AVAudioFile(forWriting: url, settings: format.settings,
+                               commonFormat: .pcmFormatFloat32, interleaved: false)
+        self.url = url
+        lock.withLock { firstHost = nil }
+        input.installTap(onBus: 0, bufferSize: 2048, format: format) { [weak self] buffer, when in
+            guard let self else { return }
+            self.lock.withLock {
+                if self.firstHost == nil, when.isHostTimeValid { self.firstHost = when.hostTime }
+            }
+            try? self.file?.write(from: buffer)
+        }
+        engine.prepare()
+        try engine.start()
+    }
+
+    func stop() {
+        engine.inputNode.removeTap(onBus: 0)
+        engine.stop()
+        file = nil  // closes the file
     }
 }

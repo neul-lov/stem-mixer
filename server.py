@@ -489,11 +489,83 @@ def delete_song(song_id: str):
 
 
 @app.get("/api/songs/{song_id}/{stem}.wav")
-def stem_file(song_id: str, stem: str):
-    p = (LIBRARY / song_id / f"{stem}.wav").resolve()
-    if stem not in STEMS_6 or p.parent.parent != LIBRARY.resolve() or not p.exists():
+def stem_file(song_id: str, stem: str, original: int = 0):
+    folder = song_folder(song_id)
+    meta = json.loads((folder / "meta.json").read_text())
+    user = (meta.get("replaced") or {}).get(stem)
+    p = folder / "user" / f"{stem}.wav" if user and user.get("use") and not original else folder / f"{stem}.wav"
+    if stem not in STEMS_6 or not p.exists():
         raise HTTPException(404)
     return FileResponse(p, media_type="audio/wav")
+
+
+# ---------------------------------------------------------------- 내 트랙으로 바꾸기
+def song_folder(song_id):
+    folder = (LIBRARY / song_id).resolve()
+    if folder.parent != LIBRARY.resolve() or not (folder / "meta.json").exists():
+        raise HTTPException(404, "곡을 찾지 못했어요")
+    return folder
+
+
+def render_user_track(folder, stem, offset):
+    """보관한 내 파일을 곡과 같은 형식·길이로 바꾼다. offset(초)만큼 늦게 (음수면 앞을 잘라) 시작."""
+    src = next((folder / "user").glob(f"{stem}.src.*"))
+    y = decode(src)
+    n = sf.info(folder / f"{stem}.wav").frames
+    shift = int(round(offset * SR))
+    y = np.concatenate([np.zeros((shift, 2), np.float32), y]) if shift > 0 else y[-shift:]
+    y = y[:n] if len(y) >= n else np.concatenate([y, np.zeros((n - len(y), 2), np.float32)])
+    sf.write(folder / "user" / f"{stem}.wav", np.clip(y, -1, 1), SR, subtype="PCM_24")
+
+
+@app.post("/api/songs/{song_id}/user-track")
+def set_user_track(song_id: str, stem: str = Form(...), path: str = Form(None), name: str = Form(None),
+                   base: float = Form(None), nudge: float = Form(None), use: int = Form(None)):
+    """트랙을 내 파일(또는 앱에서 녹음한 것)로 바꾸거나, 싱크(nudge)·사용 여부를 바꾼다.
+    base = 녹음이 곡의 몇 초에서 시작하는지 (파일은 보통 0), nudge = 손으로 맞춘 미세 조정(초)."""
+    folder = song_folder(song_id)
+    meta = json.loads((folder / "meta.json").read_text())
+    if stem not in meta["stems"]:
+        raise HTTPException(400, "그 트랙이 없어요")
+    replaced = meta.get("replaced") or {}
+    cur = replaced.get(stem) or {"name": None, "base": 0.0, "nudge": 0.0, "use": True}
+    if path:
+        f = Path(path).expanduser()
+        if not f.is_file():
+            raise HTTPException(400, "파일을 찾지 못했어요")
+        (folder / "user").mkdir(exist_ok=True)
+        for old in (folder / "user").glob(f"{stem}.src.*"):
+            old.unlink()
+        shutil.copyfile(f, folder / "user" / f"{stem}.src{f.suffix.lower() or '.wav'}")
+        cur = {"name": name or f.stem, "base": 0.0, "nudge": 0.0, "use": True}
+    elif stem not in replaced:
+        raise HTTPException(400, "먼저 파일을 넣어 주세요")
+    if base is not None:
+        cur["base"] = base
+    if nudge is not None:
+        cur["nudge"] = max(-2.0, min(2.0, nudge))
+    if use is not None:
+        cur["use"] = bool(use)
+    try:
+        if path or base is not None or nudge is not None:
+            render_user_track(folder, stem, cur["base"] + cur["nudge"])
+    except subprocess.CalledProcessError:
+        raise HTTPException(400, "오디오 파일을 읽지 못했어요. wav, mp3, m4a, aiff 파일을 넣어 주세요.")
+    replaced[stem] = cur
+    meta["replaced"] = replaced
+    (folder / "meta.json").write_text(json.dumps(meta, ensure_ascii=False))
+    return meta
+
+
+@app.delete("/api/songs/{song_id}/user-track/{stem}")
+def remove_user_track(song_id: str, stem: str):
+    folder = song_folder(song_id)
+    meta = json.loads((folder / "meta.json").read_text())
+    (meta.get("replaced") or {}).pop(stem, None)
+    for f in (folder / "user").glob(f"{stem}.*") if (folder / "user").exists() else []:
+        f.unlink()
+    (folder / "meta.json").write_text(json.dumps(meta, ensure_ascii=False))
+    return meta
 
 
 app.mount("/", StaticFiles(directory=ROOT / "static", html=True), name="static")
