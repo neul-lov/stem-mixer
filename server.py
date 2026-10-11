@@ -484,6 +484,7 @@ def run_job(job_id, mode, text=None, upload_path=None, title=None, resplit=None)
             for name in names:  # FLAC: 소리는 wav와 똑같고 크기는 60% 정도
                 audiofile.write(folder, name, stems[name] * scale)
             shutil.rmtree(folder / "pitch", ignore_errors=True)  # 다시 나눴으면 음높이 선도 다시
+            shutil.rmtree(folder / "lyrics", ignore_errors=True)  # 받아 적은 가사도
             if not kept_source(key):  # 다음에 다른 방식으로 나눌 때 쓰도록 원본 보관
                 shutil.move(src, SOURCES / f"{key}{src.suffix.lower()}")
             src.unlink(missing_ok=True)
@@ -623,7 +624,7 @@ def _leftovers():
     if not busy:  # 꺼지는 바람에 곡 폴더 안에 남은 반쯤 쓴 파일 (.vocals-1a2b3c4d.tmp.flac 등)
         now = time.time()
         for meta in LIBRARY.glob("*/meta.json"):  # 곡 폴더만 (meta.json 없는 폴더는 위에서 통째로)
-            for pat in (".*.tmp.flac", "user/.*.tmp.flac", "pitch/.*.tmp"):
+            for pat in (".*.tmp.flac", "user/.*.tmp.flac", "pitch/.*.tmp", "lyrics/.*.tmp"):
                 for f in meta.parent.glob(pat):
                     try:
                         if now - f.stat().st_mtime > 600:
@@ -895,6 +896,66 @@ def start_pitch(song_id: str, stem: str):
     return {"job_id": job_id}
 
 
+# ---------------------------------------------------------------- 가사 받아 적기 (AI)
+def run_lyrics(job_id, song_id, stem, notes, language):
+    import lyrics as ly
+
+    job = jobs[job_id]
+    try:
+        with work_lock:
+            folder = song_folder(song_id)
+            meta = json.loads((folder / "meta.json").read_text())
+            source = pitch_source(meta, stem)
+            cache = folder / "lyrics" / f"{stem}.json"
+            saved = json.loads(cache.read_text()) if cache.exists() else {}
+            # 같은 소리를 같은 언어 설정으로 이미 받아 적었으면 다시 듣지 않는다 (음표만 다시 맞춘다)
+            if saved.get("source") == source and saved.get("asked") == language:
+                lang, words = saved["language"], [tuple(w) for w in saved["words"]]
+            else:
+                mine = ((meta.get("replaced") or {}).get(stem) or {}).get("use")
+                job.update(step="트랙 읽는 중", progress=0.0)
+                y = audiofile.read(folder / "user" if mine else folder, stem)
+                lang, words = ly.words(y, ly.LANGUAGES.get(language), lambda p: job.update(progress=0.9 * p),
+                                       lambda text: job.update(step=text))
+                cache.parent.mkdir(exist_ok=True)
+                tmp = cache.with_name(f".{stem}-{uuid.uuid4().hex[:8]}.tmp")
+                tmp.write_text(json.dumps({"source": source, "asked": language, "language": lang,
+                                           "words": [[round(a, 3), round(b, 3), t] for a, b, t in words]},
+                                          ensure_ascii=False))
+                os.replace(tmp, cache)
+            job.update(step="음표에 가사 붙이는 중", progress=0.95)
+            fitted, placed, dropped = ly.fit(notes, words, lang)
+            job["result"] = {"notes": fitted, "language": lang, "placed": placed, "dropped": dropped,
+                             "text": " ".join(t for _, _, t in words)[:4000]}
+            job.update(status="done", song_id=song_id, progress=1.0)
+    except Exception as e:
+        traceback.print_exc()
+        job.update(status="error", error=f"가사를 받아 적지 못했어요: {str(e).splitlines()[0] if str(e) else type(e).__name__}")
+
+
+@app.post("/api/songs/{song_id}/lyrics/{stem}")
+def start_lyrics(song_id: str, stem: str, notes: str = Form(...), language: str = Form("auto")):
+    """노래를 듣고 가사를 받아 적어서, 보낸 음표(편집 중인 음표)에 한 음절씩 붙여 돌려준다. 저장은 하지 않는다."""
+    import lyrics as ly
+    import transcribe as tr
+
+    meta = json.loads((song_folder(song_id) / "meta.json").read_text())
+    if stem not in meta["stems"] or stem == "drums":
+        raise HTTPException(400, "이 트랙은 가사를 받아 적을 수 없어요")
+    if language not in ly.LANGUAGES:
+        raise HTTPException(400, "모르는 언어예요")
+    try:
+        clean = tr.clean_input(json.loads(notes))
+    except Exception:
+        raise HTTPException(400, "음표를 읽지 못했어요")
+    if not clean:
+        raise HTTPException(400, "가사를 붙일 음표가 없어요. 먼저 음정을 뽑아 주세요")
+    job_id = uuid.uuid4().hex
+    jobs[job_id] = {"status": "running", "step": "대기 중", "progress": 0.0}
+    threading.Thread(target=run_lyrics, args=(job_id, song_id, stem, clean, language), daemon=True).start()
+    return {"job_id": job_id}
+
+
 @app.post("/api/songs/{song_id}/midi/{stem}")
 def rerender_midi(song_id: str, stem: str, sound: str = Form(None), transpose: int = Form(None), snap: int = Form(None),
                   tempo: float = Form(None)):
@@ -959,6 +1020,7 @@ def utau_export(song_id: str, stem: str = Form("vocals"), dest: str = Form(...),
         f"  '반주' 트랙이 같이 들어 있어요. '원래 {label}' 트랙은 음소거돼 있으니 참고할 때 켜세요.\n"
         f"- project.ust: UTAU용 (같은 음표). melody.mid: 다른 보컬 신스용.\n"
         f"- 빠르기 {tempo:g} BPM, 1마디 첫 박 = 곡 시작(0초). 음표 {n}개. 편집 화면에서 넣은 가사가 들어 있고, 가사 없는 음표는 'ら'.\n"
+        f"  가사 '+'는 앞 음절을 늘여 부르기(OpenUtau). UTAU용 .ust에서는 앞 음절의 모음으로 바꿔 두었어요.\n"
         f"- 다 되면 OpenUtau에서 보컬 트랙을 wav로 내보내고(처음부터), StemMixer의 {label} 트랙에 끌어다 놓으세요.\n"
         f"  0초부터 시작하는 wav면 싱크가 그대로 맞아요.\n", encoding="utf-8")
     return {"folder": str(out), "notes": n, "tempo": tempo}

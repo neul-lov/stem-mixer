@@ -73,6 +73,13 @@ final class NoteEditor: ObservableObject, Identifiable {
         canvas?.needsDisplay = true
     }
 
+    /// "AI 가사": what the lyrics job is doing (nil = not running).
+    @Published var lyricsStep: String?
+    @Published var lyricsProgress: Double = 0
+    static let lyricLanguages: [(id: String, title: String)] = [
+        ("auto", "언어 자동으로 찾기"), ("ko", "한국어"), ("ja", "日本語"), ("en", "English"), ("zh", "中文"),
+    ]
+
     /// Opens the "가사 한꺼번에 넣기" sheet.
     @Published var lyricSheet = false {
         didSet { if lyricSheet { canvas?.endLyric() } }
@@ -1120,6 +1127,12 @@ struct NoteEditorView: View {
             Menu {
                 Button("MIDI · OpenUtau · UTAU 파일 가져오기…") { model.importNotes(for: editor.stem) }
                 Divider()
+                Menu("AI로 가사 받아 적기") {
+                    ForEach(NoteEditor.lyricLanguages, id: \.id) { lang in
+                        Button(lang.title) { model.extractLyrics(language: lang.id) }
+                    }
+                }
+                .disabled(editor.notes.isEmpty || editor.lyricsStep != nil)
                 Button("가사 한꺼번에 넣기…") { editor.lyricSheet = true }
                     .disabled(editor.notes.isEmpty)
                 Button(editor.selection.isEmpty ? "가사 모두 지우기" : "선택한 음표의 가사 지우기") { editor.clearLyrics() }
@@ -1208,6 +1221,27 @@ struct NoteEditorView: View {
             toolButton("metronome", "박자 맞추기", help: "선택한 음표(없으면 전체)를 격자에 맞춰요 (Q)") { editor.quantize() }
             toolButton("arrow.down", "반음", help: "선택한 음표(없으면 전체)를 반음 내려요 (↓)") { editor.transposeSelection(-1) }
             toolButton("arrow.up", "반음", help: "선택한 음표(없으면 전체)를 반음 올려요 (↑)") { editor.transposeSelection(1) }
+
+            divider
+
+            if let step = editor.lyricsStep {
+                HStack(spacing: 5) {
+                    ProgressView().controlSize(.small)
+                    Text("\(step) \(Int(editor.lyricsProgress * 100))%").monospacedDigit().foregroundStyle(.secondary)
+                }
+            } else {
+                Menu {
+                    ForEach(NoteEditor.lyricLanguages, id: \.id) { lang in
+                        Button(lang.title) { model.extractLyrics(language: lang.id) }
+                    }
+                } label: {
+                    Label("AI 가사", systemImage: "text.bubble")
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                .disabled(editor.notes.isEmpty)
+                .help("노래를 듣고 가사를 받아 적어서 음표마다 한 음절씩 넣어요. 틀린 곳은 음표를 고르고 Return으로 고치면 돼요")
+            }
 
             divider
 

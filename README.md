@@ -46,11 +46,17 @@
     "가져오기 · 더보기 → 가사 한꺼번에 넣기…"(또는 오른쪽 클릭)에 가사를 붙여 넣으면 음절마다 차례로 들어가요
     (일본어는 가나 한 글자, きゃ처럼 작은 글자는 앞 글자와 함께 · 한국어는 한 글자 · 영어는 단어 하나).
     넣은 가사는 OpenUtau(.ustx) · UTAU(.ust) · MIDI(가사 이벤트) 내보내기에 들어가고, 이 파일들을 가져올 때도 가사를 읽어요.
+  - **AI 가사**: 도구 막대의 "AI 가사"(또는 가져오기 · 더보기 → AI로 가사 받아 적기)를 누르면 Whisper가 노래를 듣고 가사를 받아 적어서
+    음표마다 한 음절씩 넣어요. 언어는 자동으로 찾거나 고를 수 있어요. 일본어 한자는 히라가나로 바꿔요(OpenUtau 가수가 읽게).
+    한 음절을 여러 음표에 걸쳐 부르면 뒤 음표는 "+"(앞 음절 늘여 부르기), 음절이 더 많으면 긴 음표를 나눠요. ⌘Z로 되돌릴 수 있어요.
+    처음 한 번 모델(1.5GB 정도)을 받아요. 노래 가사라서 틀리는 곳이 있으니 음표를 고르고 Return으로 고치세요.
   - "적용해서 듣기"(⌘S)를 누르면 음정 트랙 소리 · MIDI 파일 · OpenUtau 내보내기에 반영돼요. "완료"는 적용하고 닫기.
     고친 뒤에도 "가져오기 · 더보기 → AI가 뽑은 음표로 되돌리기"로 돌아갈 수 있어요.
 - **다른 곳에서 만든 음표 가져오기**: MIDI(.mid), OpenUtau(.ustx), UTAU(.ust) 파일을 트랙 위에 끌어다 놓거나
   오른쪽 클릭 → "MIDI · UST 파일 가져오기…". 편집 화면으로 열려서 확인한 뒤 적용해요. 트랙이 여러 개인 MIDI는 고르거나 합칠 수 있고,
   이미 음표가 있으면 바꾸기 / 더하기를 골라요. 파일의 0초 = 곡 0초예요 (어긋나면 ⌘A 하고 끌어서 맞추세요).
+- **OpenUtau로 바로 보내기**: 보컬 트랙 오른쪽 클릭 → "OpenUtau로 보내기 (음정 · 가사 자동)…". 음정이 없으면 뽑고, 가사가 없으면 받아 적어서
+  저장한 뒤 아래 OpenUtau 프로젝트를 만들어 OpenUtau로 바로 열어요. 가수만 고르면 목소리가 바뀌고, 고칠 곳은 OpenUtau에서 고치면 돼요.
 - **보컬 신스로 다시 부르기 (OpenUtau · UTAU)**: 보컬 음정 트랙의 "MIDI" 버튼 → "OpenUtau · UTAU로 내보내기…".
   폴더 하나에 `project.ustx`(OpenUtau), `project.ust`(UTAU), `melody.mid`, `backing.wav`(그 파트만 뺀 반주),
   `guide_vocals.wav`(원래 보컬, 음소거된 참고 트랙)가 생겨요. 프로젝트 0틱 = 곡 0초라서, OpenUtau에서 가수
@@ -147,6 +153,8 @@ MUSDB18 테스트 곡 12개로 잰 점수 (SDR, dB, 높을수록 깨끗함)와 �
 | [torchcrepe](https://github.com/maxrmorrison/torchcrepe) | 베이스 음표 · 편집 화면 음높이 선 | MIT |
 | [basic-pitch](https://github.com/spotify/basic-pitch) (Spotify) | 화음 악기 음표 읽기 | Apache-2.0 |
 | [pretty_midi](https://github.com/craffel/pretty-midi) | MIDI 파일 쓰기 | MIT |
+| [Whisper](https://github.com/openai/whisper) (mlx-whisper · faster-whisper) | 가사 받아 적기 | MIT |
+| [fugashi](https://github.com/polm/fugashi) · [unidic-lite](https://github.com/polm/unidic-lite) | 일본어 한자 → 가나 | MIT · BSD |
 | [BS-Roformer SW](https://mvsep.com) (jarredou / MVSEP) | 6개 악기 분리 가중치 (처음 실행 때 내려받음) | 명시된 라이선스 없음 — 상업적으로 쓰려면 확인 필요 |
 | [python-audio-separator](https://github.com/nomadkaraoke/python-audio-separator) | RoFormer 모델 실행 | MIT |
 | [MelBand RoFormer 보컬 모델](https://github.com/KimberleyJensen/Mel-Band-Roformer-Vocal-Model) (Kimberley Jensen) | 보컬 분리 가중치 (처음 실행 때 내려받음, 저장소에 포함 안 됨) | 저장소에 명시된 라이선스 없음 — 상업적으로 쓰려면 확인 필요 |

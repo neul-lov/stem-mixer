@@ -838,24 +838,179 @@ final class AppModel: ObservableObject {
         updateUserTrack(stem, "음정 트랙을 지웠어요") { try await self.backend.deleteMidi(song.id, stem: stem) }
     }
 
-    /// Exports the melody as an OpenUtau / UTAU project to tune with a vocal synth (e.g. Kasane Teto),
-    /// with the backing track inside, so the rendered vocal can be dropped back on the track at 0 s.
-    func exportUtau(_ stem: String, quantize: Bool) {
-        guard let song else { return }
+    /// Follows a server job, showing its step and progress in the job bar. Throws when it fails.
+    private func follow(_ jobID: String) async throws {
+        var misses = 0
+        while true {
+            try await Task.sleep(for: .milliseconds(500))
+            guard let status = try? await backend.job(jobID) else {
+                misses += 1
+                if misses >= 20 { throw engineStopped() }
+                continue
+            }
+            misses = 0
+            if status.status == "error" { throw BackendError(message: status.error ?? "알 수 없는 오류") }
+            job?.step = status.step ?? ""
+            job?.progress = status.progress ?? 0
+            if status.status == "done" { return }
+        }
+    }
+
+    /// "AI 가사": listens to the track, writes the lyrics down and puts one syllable on each note (⌘Z undoes it).
+    func extractLyrics(language: String) {
+        guard let song, let ed = editor, ed.lyricsStep == nil, !ed.notes.isEmpty else { return }
+        ed.canvas?.endLyric()
+        if ed.hasLyrics {
+            let alert = NSAlert()
+            alert.messageText = "AI가 받아 적은 가사로 바꿀까요?"
+            alert.informativeText = "지금 넣어 둔 가사가 바뀌어요. 바꾼 뒤에도 ⌘Z로 되돌릴 수 있어요."
+            alert.addButton(withTitle: "바꾸기")
+            alert.addButton(withTitle: "취소")
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+        }
+        let sent = ed.midiNotes
+        ed.lyricsStep = "대기 중"
+        ed.lyricsProgress = 0
+        Task {
+            defer { ed.lyricsStep = nil }
+            do {
+                let id = try await backend.startLyrics(song.id, stem: ed.stem, notes: sent, language: language)
+                var misses = 0
+                while editor === ed {
+                    try await Task.sleep(for: .milliseconds(600))
+                    guard let status = try? await backend.job(id) else {
+                        misses += 1
+                        if misses >= 20 { throw engineStopped() }
+                        continue
+                    }
+                    misses = 0
+                    if status.status == "error" { throw BackendError(message: status.error ?? "가사를 받아 적지 못했어요") }
+                    ed.lyricsStep = status.step ?? "가사 받아 적는 중"
+                    ed.lyricsProgress = status.progress ?? 0
+                    if status.status == "done" { break }
+                }
+                guard editor === ed else { return }
+                let result = try await backend.lyricsResult(id)
+                guard ed.midiNotes == sent else {
+                    show("받아 적는 동안 음표가 바뀌어서 넣지 않았어요. 다시 눌러 주세요", success: false)
+                    return
+                }
+                guard result.placed > 0 else {
+                    show("가사를 알아듣지 못했어요. 언어를 골라서 다시 해 보세요", success: false)
+                    return
+                }
+                ed.canvas?.endLyric()
+                let view = ed.viewStart
+                ed.setNotes(result.notes, add: false)
+                ed.selection = []
+                ed.viewStart = view
+                ed.canvas?.needsDisplay = true
+                let missed = result.dropped > 0 ? " · 음표를 못 찾은 음절 \(result.dropped)개" : ""
+                show("가사 \(result.placed)개를 넣었어요\(missed) · 틀린 곳은 음표를 고르고 Return으로 고치세요")
+            } catch {
+                show(error.localizedDescription, success: false)
+            }
+        }
+    }
+
+    /// One click from the vocal track to OpenUtau: reads the notes (if there are none yet) and the lyrics
+    /// (if the notes have none), saves them, writes the OpenUtau project with the backing track and opens it.
+    func sendToOpenUtau(_ stem: String) {
+        guard let song, server == .ready, job == nil else { return }
+        if let ed = editor, ed.stem == stem {
+            ed.canvas?.endLyric()
+            if ed.dirty {
+                show("편집 중인 음표를 먼저 적용해 주세요 (⌘S)", success: false)
+                return
+            }
+            finishEditing()
+        }
+        guard let dest = pickUtauFolder() else { return }
+        let id = song.id
+        jobError = nil
+        withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
+            job = Job(label: "\(song.title) · OpenUtau로 보내기")
+        }
+        Task {
+            do {
+                if self.song?.midi(for: stem) == nil {
+                    try await follow(try await backend.transcribe(id, stem: stem, sound: "piano", snap: false))
+                    let meta = try await backend.song(id)
+                    if self.song?.id == id {
+                        reload(meta)
+                        tracks["\(stem)_midi"] = TrackState()
+                        applyGains()
+                    }
+                }
+                let notes = try await backend.midiNotes(id, stem: stem)
+                var lyricNote = ""
+                if !notes.contains(where: { !($0.lyric ?? "").isEmpty }) {
+                    job?.step = "가사 받아 적는 중"
+                    job?.progress = 0
+                    let lyricsJob = try await backend.startLyrics(id, stem: stem, notes: notes, language: "auto")
+                    try await follow(lyricsJob)
+                    let result = try await backend.lyricsResult(lyricsJob)
+                    if result.placed > 0 {
+                        let meta = try await backend.saveNotes(id, stem: stem, notes: result.notes, tempo: nil, origin: nil)
+                        if self.song?.id == id { reload(meta) }
+                        lyricNote = " · 가사 \(result.placed)개"
+                    } else {
+                        lyricNote = " · 가사는 못 알아들었어요"
+                    }
+                }
+                job?.step = "OpenUtau 프로젝트 만드는 중"
+                job?.progress = 1
+                let folder = try await backend.utauExport(id, stem: stem, dest: dest, quantize: false)
+                withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) { job = nil }
+                openUtauProject(folder, note: lyricNote)
+            } catch {
+                withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
+                    job = nil
+                    jobError = error.localizedDescription
+                }
+            }
+        }
+    }
+
+    /// Asks where to put the OpenUtau project folder (starts where the last one went).
+    private func pickUtauFolder() -> URL? {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
         panel.canCreateDirectories = true
         panel.prompt = "여기에 내보내기"
         panel.message = "OpenUtau 프로젝트 폴더를 만들 곳을 고르세요"
-        panel.directoryURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
-        guard panel.runModal() == .OK, let dest = panel.url else { return }
+        let last = UserDefaults.standard.url(forKey: "utau.dest")
+        panel.directoryURL = last ?? FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+        guard panel.runModal() == .OK, let dest = panel.url else { return nil }
+        UserDefaults.standard.set(dest, forKey: "utau.dest")
+        return dest
+    }
+
+    /// Opens project.ustx in OpenUtau when it's installed; otherwise shows it in Finder.
+    private func openUtauProject(_ folder: URL, note: String = "") {
+        let ustx = folder.appendingPathComponent("project.ustx")
+        let installed = ["/Applications/OpenUtau.app", NSHomeDirectory() + "/Applications/OpenUtau.app"]
+            .map { URL(fileURLWithPath: $0) }.first { FileManager.default.fileExists(atPath: $0.path) }
+        let handler = NSWorkspace.shared.urlForApplication(toOpen: ustx)
+        if let app = installed ?? handler.flatMap({ $0.lastPathComponent.lowercased().contains("openutau") ? $0 : nil }) {
+            NSWorkspace.shared.open([ustx], withApplicationAt: app, configuration: NSWorkspace.OpenConfiguration())
+            show("OpenUtau로 열었어요\(note) · 첫 트랙에서 가수를 고르세요")
+        } else {
+            NSWorkspace.shared.activateFileViewerSelecting([ustx])
+            show("OpenUtau 프로젝트를 만들었어요\(note) · project.ustx를 OpenUtau로 여세요")
+        }
+    }
+
+    /// Exports the melody as an OpenUtau / UTAU project to tune with a vocal synth (e.g. Kasane Teto),
+    /// with the backing track inside, so the rendered vocal can be dropped back on the track at 0 s.
+    func exportUtau(_ stem: String, quantize: Bool) {
+        guard let song, let dest = pickUtauFolder() else { return }
         busyStem = "\(stem)_midi"
         Task {
             do {
                 let folder = try await backend.utauExport(song.id, stem: stem, dest: dest, quantize: quantize)
-                NSWorkspace.shared.activateFileViewerSelecting([folder.appendingPathComponent("project.ustx")])
-                show("OpenUtau 프로젝트를 만들었어요")
+                openUtauProject(folder)
             } catch {
                 show(error.localizedDescription, success: false)
             }

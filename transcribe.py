@@ -860,6 +860,18 @@ def write_ustx(path, notes, tempo, name, waves, lyric="ら"):
     return len(vnotes)
 
 
+_VOWELS = {v: row for row, chars in {
+    "あ": "あかさたなはまやらわがざだばぱぁゃゎ", "い": "いきしちにひみりぎじぢびぴぃ",
+    "う": "うくすつぬふむゆるぐずづぶぷぅゅゔ", "え": "えけせてねへめれげぜでべぺぇ",
+    "お": "おこそとのほもよろをごぞどぼぽぉょ"}.items() for v in chars}
+
+
+def _vowel(text):
+    """늘여 부를 때 쓸 앞 음절의 모음: 가나면 あいうえお 중 하나, 아니면 앞 음절 그대로 (ん은 ん)."""
+    last = text[-1:] if text else ""
+    return "ん" if last == "ん" else _VOWELS.get(last, text or "ら")
+
+
 def write_ust(path, notes, tempo, name, lyric="ら"):
     """UTAU용 .ust (쉼표는 R 음표로 채운다). Shift-JIS로 저장 (UTAU 기본).
     한글처럼 Shift-JIS에 없는 글자가 있으면 UTF-8로 (OpenUtau · 새 UTAU는 Charset=UTF-8을 읽는다)."""
@@ -874,6 +886,7 @@ def write_ust(path, notes, tempo, name, lyric="ら"):
                       "PreUtterance=", "Intensity=100", "Modulation=0"])
         idx += 1
 
+    prev = lyric
     for n in notes:
         s, e, p, v = n[:4]
         a, b = to_ticks(s, tempo), to_ticks(e, tempo)
@@ -885,7 +898,11 @@ def write_ust(path, notes, tempo, name, lyric="ら"):
             a = cursor
             if b <= a:
                 continue
-        note(b - a, lyric_of(n) or lyric, int(p))
+        text = lyric_of(n) or lyric
+        if text.startswith("+"):  # OpenUtau의 "늘여 부르기"는 UTAU에 없다: 앞 음절의 모음으로 (か → あ)
+            text = _vowel(prev)
+        note(b - a, text, int(p))
+        prev = text
         cursor = b
     lines.append("[#TRACKEND]")
     text = "\r\n".join(lines) + "\r\n"

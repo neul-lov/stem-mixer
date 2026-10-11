@@ -285,6 +285,38 @@ final class Backend {
         return id
     }
 
+    /// Listens to the track and writes down the lyrics, fitted onto `notes` (one syllable per note).
+    /// Nothing is saved. Returns the job id; read the result with `lyricsResult` when it's done.
+    func startLyrics(_ songID: String, stem: String, notes: [MidiNote], language: String) async throws -> String {
+        let json = String(data: try JSONEncoder().encode(notes), encoding: .utf8) ?? "[]"
+        let data = try await post("api/songs/\(songID)/lyrics/\(stem)", [
+            URLQueryItem(name: "notes", value: json), URLQueryItem(name: "language", value: language),
+        ])
+        guard let id = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["job_id"] as? String else {
+            throw BackendError(message: "요청이 실패했어요")
+        }
+        return id
+    }
+
+    struct LyricsResult: Decodable {
+        /// The notes with lyrics (long notes may be split so every syllable gets one; "+" = hold the syllable before).
+        let notes: [MidiNote]
+        let language: String
+        /// Notes that got a syllable, and syllables that found no note.
+        let placed: Int
+        let dropped: Int
+        let text: String
+    }
+
+    func lyricsResult(_ jobID: String) async throws -> LyricsResult {
+        struct R: Decodable { let result: LyricsResult? }
+        let (data, _) = try await URLSession.shared.data(from: base.appendingPathComponent("api/jobs/\(jobID)"))
+        guard let result = try JSONDecoder().decode(R.self, from: data).result else {
+            throw BackendError(message: "가사를 받아 적지 못했어요")
+        }
+        return result
+    }
+
     /// Converts the library's old wav tracks to FLAC. Returns the job id.
     func compact() async throws -> String {
         let data = try await post("api/compact", [])

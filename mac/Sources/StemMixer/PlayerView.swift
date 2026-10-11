@@ -381,6 +381,10 @@ struct TrackRow: View {
                 if midi.source == "vocals" || midi.source == "bass" {
                     Button("OpenUtau · UTAU로 내보내기…") { model.exportUtau(midi.source, quantize: false) }
                 }
+                if midi.source == "vocals" {
+                    Button("OpenUtau로 보내기 (가사 자동)…") { model.sendToOpenUtau(midi.source) }
+                        .disabled(model.job != nil)
+                }
                 Button("음정 트랙 지우기", role: .destructive) { model.removeMidi(midi.source) }
             } else {
                 Button("내 파일로 바꾸기…") { model.chooseReplacement(for: name) }
@@ -407,6 +411,11 @@ struct TrackRow: View {
                         }
                     }
                     .disabled(model.job != nil)
+                    if name == "vocals" {
+                        Button("OpenUtau로 보내기 (음정 · 가사 자동)…") { model.sendToOpenUtau(name) }
+                            .disabled(model.job != nil)
+                            .help("음정과 가사를 AI로 뽑아서 반주와 함께 OpenUtau 프로젝트로 만들고 바로 열어요")
+                    }
                 }
             }
             Divider()
@@ -701,6 +710,12 @@ struct MidiSettings: View {
                             .help("음표를 16분음표 격자에 맞춰서 내보내요 (빠르기가 맞을 때만 쓰세요)")
                     }
                     .font(.system(size: 12, weight: .semibold))
+                    if stem == "vocals" {
+                        Button("가사까지 AI로 넣어서 보내기…") { model.sendToOpenUtau(stem) }
+                            .font(.system(size: 12, weight: .semibold))
+                            .disabled(model.job != nil)
+                            .help("음표에 가사가 없으면 노래를 듣고 받아 적어서 넣은 뒤 OpenUtau로 열어요")
+                    }
                     Text("반주 트랙이 같이 들어가요. 조율해서 0초부터 wav로 내보낸 뒤 \(StemInfo.of(stem).label) 트랙에 끌어다 놓으면 싱크가 맞아요. 빠르기가 맞는지 먼저 확인하세요 (지금 \(Int(midi.tempo ?? 120)) BPM).")
                         .font(.system(size: 10.5)).foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
