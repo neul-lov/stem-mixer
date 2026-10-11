@@ -250,9 +250,16 @@ struct Sidebar: View {
         HStack(alignment: .top, spacing: 8) {
             Image(systemName: "exclamationmark.triangle.fill")
                 .foregroundStyle(.red)
-            Text(message)
-                .font(.system(size: 12, weight: .medium))
-                .fixedSize(horizontal: false, vertical: true)
+            VStack(alignment: .leading, spacing: 6) {
+                Text(message)
+                    .font(.system(size: 12, weight: .medium))
+                    .fixedSize(horizontal: false, vertical: true)
+                if let anyway = model.splitAnyway {
+                    Button("노래 맞아요 · 그래도 나누기") { anyway() }
+                        .font(.system(size: 11.5, weight: .semibold))
+                        .help("노래인지 확인하지 않고 나눠요")
+                }
+            }
             Spacer(minLength: 0)
             Button { withAnimation { model.jobError = nil } } label: {
                 Image(systemName: "xmark").font(.system(size: 10, weight: .bold)).foregroundStyle(.secondary)

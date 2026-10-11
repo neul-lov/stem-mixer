@@ -11,6 +11,9 @@
 - 링크 칸에 유튜브 · 스포티파이 · 애플뮤직 · 사운드클라우드 링크나 그냥 곡 제목을 넣어도 돼요.
   스포티파이/애플뮤직은 음원이 DRM으로 막혀 있어서, 곡 정보(가수·제목·길이)를 읽은 뒤
   유튜브에서 길이가 가장 비슷한 영상을 찾아 받아요. 찾은 영상 제목이 플레이어 위에 표시돼요.
+- 노래가 아닌 영상(말하는 영상 · 방송 · 강의)은 나누지 않아요. 라이브 방송과 20분 넘는 영상은 바로 막고,
+  유튜브 '음악' 분류가 아니면 받은 뒤 곡 여기저기를 AI(PANNs)로 들어 보고 음악이 절반도 안 나오면 멈춰요.
+  노래가 맞는데 막혔으면 오류 칸의 "노래 맞아요 · 그래도 나누기"를 누르세요 (받은 파일을 다시 써요).
 - 이미 분리한 곡을 다른 방식(AI 4트랙 · AI 6트랙 · 빠르게)으로 다시 나누려면 목록에서 곡에 마우스를 올리고 ↻ 버튼
   (또는 오른쪽 클릭 → 다른 방식으로 분리, 플레이어 위의 "다른 방식으로 분리"). 이미 만든 버전이 있으면 그걸 열어요.
   원본 오디오는 `library/_sources/` 에 보관해서 다시 받지 않아요 (곡의 모든 버전을 지우면 같이 지워져요).
@@ -153,6 +156,7 @@ MUSDB18 테스트 곡 12개로 잰 점수 (SDR, dB, 높을수록 깨끗함)와 �
 | [torchcrepe](https://github.com/maxrmorrison/torchcrepe) | 베이스 음표 · 편집 화면 음높이 선 | MIT |
 | [basic-pitch](https://github.com/spotify/basic-pitch) (Spotify) | 화음 악기 음표 읽기 | Apache-2.0 |
 | [pretty_midi](https://github.com/craffel/pretty-midi) | MIDI 파일 쓰기 | MIT |
+| [PANNs](https://github.com/qiuqiangkong/panns_inference) (CNN14) | 노래인지 확인 | MIT |
 | [Whisper](https://github.com/openai/whisper) (mlx-whisper · faster-whisper) | 가사 받아 적기 | MIT |
 | [fugashi](https://github.com/polm/fugashi) · [unidic-lite](https://github.com/polm/unidic-lite) | 일본어 한자 → 가나 | MIT · BSD |
 | [BS-Roformer SW](https://mvsep.com) (jarredou / MVSEP) | 6개 악기 분리 가중치 (처음 실행 때 내려받음) | 명시된 라이선스 없음 — 상업적으로 쓰려면 확인 필요 |

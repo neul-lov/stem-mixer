@@ -90,6 +90,8 @@ struct JobStatus: Decodable {
     let error: String?
     /// Bytes saved by the FLAC job.
     let freed: Int64?
+    /// The link didn't look like a song, so it wasn't split ("그래도 나누기" sends it again with force).
+    let not_song: Bool?
 }
 
 /// Runs the Python separation server (server.py) in the background and talks to it over HTTP.
@@ -386,9 +388,10 @@ final class Backend {
     }
 
     /// Starts a separation job from a link, a search phrase, or a local file. Returns the job id.
-    func startJob(text: String? = nil, file: URL? = nil, mode: String) async throws -> String {
+    func startJob(text: String? = nil, file: URL? = nil, mode: String, force: Bool = false) async throws -> String {
         var form = URLComponents()
         form.queryItems = [URLQueryItem(name: "mode", value: mode)]
+        if force { form.queryItems?.append(URLQueryItem(name: "force", value: "1")) }
         if let text { form.queryItems?.append(URLQueryItem(name: "url", value: text)) }
         if let file { form.queryItems?.append(URLQueryItem(name: "path", value: file.path)) }
         var req = URLRequest(url: base.appendingPathComponent("api/jobs"))
@@ -451,5 +454,7 @@ final class Backend {
 
 struct BackendError: LocalizedError {
     let message: String
+    /// The server refused because the link didn't look like a song.
+    var notSong = false
     var errorDescription: String? { message }
 }

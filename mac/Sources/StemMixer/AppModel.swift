@@ -128,7 +128,9 @@ final class AppModel: ObservableObject {
         didSet { UserDefaults.standard.set(mode.rawValue, forKey: "mode") }
     }
     @Published var job: Job?
-    @Published var jobError: String?
+    @Published var jobError: String? { didSet { if jobError == nil { splitAnyway = nil } } }
+    /// Set when the last link didn't look like a song: sends it again without the check.
+    @Published var splitAnyway: (() -> Void)?
     @Published var toast: String?
 
     @Published var song: Song?
@@ -205,7 +207,11 @@ final class AppModel: ObservableObject {
     func submit() {
         let text = input.trimmingCharacters(in: .whitespacesAndNewlines)
         guard canSubmit, !text.isEmpty else { return }
-        run(label: text) { try await self.backend.startJob(text: text, mode: self.mode.rawValue) }
+        let mode = self.mode.rawValue
+        run(label: text, anyway: { [weak self] in
+            guard let self, self.server == .ready, self.job == nil else { return }
+            self.run(label: text) { try await self.backend.startJob(text: text, mode: mode, force: true) }
+        }) { try await self.backend.startJob(text: text, mode: mode) }
     }
 
     func submit(file: URL) {
@@ -249,7 +255,7 @@ final class AppModel: ObservableObject {
         submit(file: url)
     }
 
-    private func run(label: String, start: @escaping () async throws -> String) {
+    private func run(label: String, anyway: (() -> Void)? = nil, start: @escaping () async throws -> String) {
         jobError = nil
         withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) { job = Job(label: label) }
         Task {
@@ -264,7 +270,9 @@ final class AppModel: ObservableObject {
                         continue
                     }
                     misses = 0
-                    if status.status == "error" { throw BackendError(message: status.error ?? "알 수 없는 오류") }
+                    if status.status == "error" {
+                        throw BackendError(message: status.error ?? "알 수 없는 오류", notSong: status.not_song == true)
+                    }
                     job?.step = status.step ?? ""
                     job?.progress = status.progress ?? 0
                     if status.status == "done", let songID = status.song_id {
@@ -289,6 +297,7 @@ final class AppModel: ObservableObject {
                 withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
                     job = nil
                     jobError = error.localizedDescription
+                    if (error as? BackendError)?.notSong == true { splitAnyway = anyway }
                 }
             }
         }

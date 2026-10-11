@@ -425,11 +425,14 @@ def mix_stems(folder, dest):
     return dest
 
 
-def run_job(job_id, mode, text=None, upload_path=None, title=None, resplit=None):
+def run_job(job_id, mode, text=None, upload_path=None, title=None, resplit=None, force=False):
+    import musiccheck
+
     job = jobs[job_id]
     try:
         with work_lock:
             source, matched, link = "file", None, None
+            sure = True  # 노래가 확실한지 (아니면 받은 뒤 소리로 확인)
             redo = bool(resplit) and resplit.rsplit("-", 1)[1] == mode  # 같은 방식으로 다시 (새 품질 반영)
             if resplit:  # 라이브러리에 있는 곡을 다른 방식으로 다시 분리
                 old = json.loads((LIBRARY / resplit / "meta.json").read_text())
@@ -439,6 +442,10 @@ def run_job(job_id, mode, text=None, upload_path=None, title=None, resplit=None)
             elif text:
                 job["step"] = "링크 확인 중"
                 url, title, key, source = resolve(text, job)
+                # 곡 정보로 찾은 것(스포티파이 · 애플뮤직 · 검색)과 사운드클라우드는 노래로 본다.
+                # 그 밖의 영상 링크는 받기 전에 정보를 보고, 모르면 받은 뒤 소리로 확인한다.
+                if not force and source in ("youtube", "web") and not (LIBRARY / f"{key}-{mode}" / "meta.json").exists():
+                    sure = musiccheck.check_info(musiccheck.probe(url, YDL_BASE))
             else:
                 key = hashlib.sha1(upload_path.read_bytes()).hexdigest()[:11]
             song_id = f"{key}-{mode}"
@@ -460,6 +467,11 @@ def run_job(job_id, mode, text=None, upload_path=None, title=None, resplit=None)
             elif resplit:
                 job.update(step="원본 오디오 다시 받는 중", progress=0.0)
                 src, _, _ = download(link or text, folder, job)
+            elif text and kept and force:  # "그래도 나누기": 노래인지 확인하느라 받아 둔 것을 다시 쓴다
+                src = folder / ("source" + kept.suffix)
+                shutil.copyfile(kept, src)
+                link = url
+                title = title or (musiccheck.probe(url, YDL_BASE) or {}).get("title") or "제목 없음"
             elif text:
                 job.update(step="오디오 받는 중", progress=0.0)
                 src, matched, link = download(url, folder, job)
@@ -471,6 +483,13 @@ def run_job(job_id, mode, text=None, upload_path=None, title=None, resplit=None)
                 shutil.move(upload_path, src)
             job.update(step="오디오 읽는 중", progress=0.0)
             x = decode(src)
+            if text and not resplit and not force and not sure:
+                try:
+                    musiccheck.check_audio(x, lambda t: job.update(step=t))
+                except musiccheck.NotSong:
+                    if not kept_source(key):  # "그래도 나누기"를 누르면 다시 받지 않게
+                        shutil.move(src, SOURCES / f"{key}{src.suffix.lower()}")
+                    raise
             if mode in ("hq", "hq6"):
                 stems = separate_hq(x, job, six=mode == "hq6")
             elif mode in MODELS:
@@ -505,7 +524,7 @@ def run_job(job_id, mode, text=None, upload_path=None, title=None, resplit=None)
         traceback.print_exc()
         msg = str(e).replace("ERROR: ", "").split("\n")[0]
         low = msg.lower()
-        if isinstance(e, UserError):
+        if isinstance(e, (UserError, musiccheck.NotSong)):
             pass
         elif "403" in low or "forbidden" in low:
             msg = "유튜브가 이 영상 다운로드를 막았어요 (403). 잠시 뒤 다시 시도하거나, 같은 곡의 다른 영상 링크를 넣어 주세요."
@@ -529,7 +548,7 @@ def run_job(job_id, mode, text=None, upload_path=None, title=None, resplit=None)
             msg = "볼 수 없는 영상이에요 (삭제됐거나 지역 제한)."
         elif "ffmpeg" in low or "invalid data" in low:
             msg = "오디오 파일을 읽지 못했어요. 다른 형식(mp3, wav)으로 시도해 주세요."
-        job.update(status="error", error=msg)
+        job.update(status="error", error=msg, not_song=isinstance(e, musiccheck.NotSong))
         if "folder" in locals() and not (folder / "meta.json").exists():
             shutil.rmtree(folder, ignore_errors=True)
 
@@ -537,13 +556,13 @@ def run_job(job_id, mode, text=None, upload_path=None, title=None, resplit=None)
 # ---------------------------------------------------------------- API
 @app.post("/api/jobs")
 async def create_job(mode: str = Form("ai"), url: str = Form(None), path: str = Form(None),
-                     file: UploadFile = File(None)):
+                     file: UploadFile = File(None), force: int = Form(0)):
     if mode not in MODES:
         raise HTTPException(400, "mode")
     job_id = uuid.uuid4().hex
     jobs[job_id] = {"status": "running", "step": "대기 중", "progress": 0.0}
     if url and url.strip():
-        args = dict(text=url.strip())
+        args = dict(text=url.strip(), force=bool(force))  # force: 노래가 아닌 것 같아도 나누기
     elif path:  # 같은 컴퓨터의 앱이 보내는 파일 경로
         p = Path(path).expanduser()
         if not p.is_file():
