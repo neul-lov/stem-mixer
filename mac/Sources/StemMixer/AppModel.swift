@@ -1031,22 +1031,56 @@ final class AppModel: ObservableObject {
             show("OpenUtau 프로젝트를 만들었어요\(note) · project.ustx를 OpenUtau로 여세요")
             return
         }
-        // OpenUtau는 켜질 때 받은 파일 경로로 프로젝트를 연다. 이미 켜져 있으면 파일을 넘길 방법이 없어서 Finder로 보여 준다.
-        let running = NSWorkspace.shared.runningApplications.contains {
-            $0.bundleURL?.resolvingSymlinksInPath().path == app.resolvingSymlinksInPath().path
-        }
-        if running {
-            NSWorkspace.shared.activateFileViewerSelecting([ustx])
-            show("OpenUtau 프로젝트를 만들었어요\(note) · 켜져 있는 OpenUtau에서 파일 → 열기로 project.ustx를 여세요")
+        // OpenUtau는 켜질 때 받은 파일 경로로 프로젝트를 연다. 이미 켜져 있으면 넘긴 파일을 무시한다.
+        // 그때는 OpenUtau를 닫고 다시 열지 물어본다 (⌘Q와 같은 종료 요청이라 OpenUtau가 닫기를 미룰 수도 있다).
+        let path = app.resolvingSymlinksInPath().path
+        if let current = NSWorkspace.shared.runningApplications.first(where: {
+            $0.bundleURL?.resolvingSymlinksInPath().path == path
+        }) {
+            let alert = NSAlert()
+            alert.messageText = "OpenUtau가 이미 켜져 있어요"
+            alert.informativeText = "켜져 있는 OpenUtau에는 새 프로젝트를 넘길 수 없어요. OpenUtau를 닫고 이 프로젝트로 다시 열까요?\n닫기 전에 OpenUtau에서 하던 작업을 저장해 주세요."
+            alert.addButton(withTitle: "저장했어요 · 닫고 다시 열기")
+            alert.addButton(withTitle: "직접 열기")
+            guard alert.runModal() == .alertFirstButtonReturn else {
+                openUtauByHand(ustx, note: note)
+                return
+            }
+            current.activate()
+            current.terminate()
+            show("OpenUtau를 닫는 중이에요 · OpenUtau가 무언가 물으면 그 창에서 골라 주세요")
+            Task { @MainActor in
+                // 저장할지 묻는 창에서 고르는 동안 기다린다. 취소하면 OpenUtau가 그대로 켜져 있으니 직접 열기로.
+                for _ in 0..<240 where !current.isTerminated {  // 최대 2분
+                    try? await Task.sleep(for: .milliseconds(500))
+                }
+                if current.isTerminated {
+                    self.launchUtau(app, ustx, note: note)
+                } else {
+                    self.openUtauByHand(ustx, note: note)
+                }
+            }
             return
         }
+        launchUtau(app, ustx, note: note)
+    }
+
+    private func launchUtau(_ app: URL, _ ustx: URL, note: String) {
         let config = NSWorkspace.OpenConfiguration()
         config.arguments = [ustx.path]
         NSWorkspace.shared.openApplication(at: app, configuration: config) { _, error in
             guard error != nil else { return }
             Task { @MainActor in NSWorkspace.shared.activateFileViewerSelecting([ustx]) }
         }
-        show("OpenUtau를 켜서 열었어요\(note) · 첫 트랙에서 가수를 고르세요")
+        show("OpenUtau를 켜서 열었어요\(note) · 첫 트랙의 가수를 확인하세요")
+    }
+
+    /// Shows the project in Finder and copies its path, for File → Open in a running OpenUtau.
+    private func openUtauByHand(_ ustx: URL, note: String) {
+        NSWorkspace.shared.activateFileViewerSelecting([ustx])
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(ustx.path, forType: .string)
+        show("OpenUtau 프로젝트를 만들었어요\(note) · OpenUtau에서 파일 → 열기를 누르고 ⌘⇧G로 붙여 넣으세요 (경로를 복사해 뒀어요)")
     }
 
     /// Exports the melody as an OpenUtau / UTAU project to tune with a vocal synth (e.g. Kasane Teto),

@@ -844,7 +844,7 @@ def write_ustx(path, notes, tempo, name, waves, lyric="ら"):
                        "mute": mute, "solo": False, "volume": -6 if not mute else 0, "pan": 0})
         wave_parts.append({"name": track_name, "comment": "", "track_no": i, "position": 0,
                            "relative_path": file, "file_duration_ms": float(ms),
-                           "skip": 0, "trim": 0, "fadein": 0, "fadeout": 0})
+                           "skip_ms": 0.0, "trim_ms": 0.0})
     project = {
         "name": name, "comment": "StemMixer에서 내보냄. 1마디 첫 박 = 곡 시작 (0초)",
         "output_dir": "Vocal", "cache_dir": "UCache", "ustx_version": "0.6",
