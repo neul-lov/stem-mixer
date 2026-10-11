@@ -490,6 +490,8 @@ def run_job(job_id, mode, text=None, upload_path=None, title=None, resplit=None,
                     if not kept_source(key):  # "그래도 나누기"를 누르면 다시 받지 않게
                         shutil.move(src, SOURCES / f"{key}{src.suffix.lower()}")
                     raise
+                except Exception:  # 확인하는 모델을 못 받거나 못 돌리면 막지 않고 그냥 나눈다
+                    traceback.print_exc()
             if mode in ("hq", "hq6"):
                 stems = separate_hq(x, job, six=mode == "hq6")
             elif mode in MODELS:
