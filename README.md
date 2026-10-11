@@ -25,7 +25,8 @@
   - 바꾼 트랙은 곡 폴더의 `user/` 에 저장되고, 재생 · 믹스 저장 · 편집 앱으로 보내기에 그대로 쓰여요.
 - **음정 뽑기 (MIDI)**: 트랙 오른쪽 클릭 → "음정 뽑기 (MIDI)" → 소리(피아노 · 신스 리드 · 사인 · 스트링) 고르기.
   그 트랙의 음 높이와 박자를 읽어서 음표로 만들고, 깔끔한 소리로 다시 연주한 "○○ 음정" 트랙이 생겨요.
-  - 보컬 · 베이스(한 음씩)는 torchcrepe로 음 높이를 읽고, 피아노 · 기타 · 나머지(화음)는 basic-pitch로 읽어요.
+  - 보컬은 노래 채보 전용 모델 GAME(OpenVPI)으로, 피아노는 피아노 전용 모델(ByteDance)로 음표를 읽어요. 처음 한 번 모델을 받아요.
+    베이스는 torchcrepe로 음 높이를 읽고, 기타 · 나머지(화음)는 basic-pitch로 읽어요. 모델을 못 받으면 예전 방식(torchcrepe · basic-pitch)으로 읽어요.
   - "MIDI" 버튼: 소리 바꾸기, 조옮김(반음 · 옥타브), 키에 맞추기, 빠르기(BPM, ½ · ¾ · ×2), MIDI 파일 끌어놓기 · 복사.
   - 피아노 롤에서 음표가 재생 위치에 맞춰 흘러가요.
   - 정확도 (알고 있는 멜로디로 합성해서 잰 note F1, 음 시작 ±50ms): 보컬 멜로디 1.00, 반주가 섞인 보컬 0.98,
@@ -141,7 +142,9 @@ MUSDB18 테스트 곡 12개로 잰 점수 (SDR, dB, 높을수록 깨끗함)와 �
 | [yt-dlp](https://github.com/yt-dlp/yt-dlp) | 링크에서 오디오 받기 | Unlicense |
 | [PyTorch](https://pytorch.org) | AI 실행 | BSD-3-Clause |
 | [FastAPI](https://fastapi.tiangolo.com) | 로컬 서버 | MIT |
-| [torchcrepe](https://github.com/maxrmorrison/torchcrepe) | 보컬 · 베이스 음 높이 읽기 | MIT |
+| [GAME](https://github.com/openvpi/GAME) (OpenVPI) | 보컬 음표 읽기 | MIT |
+| [piano_transcription_inference](https://github.com/qiuqiangkong/piano_transcription_inference) (ByteDance) | 피아노 음표 읽기 | MIT |
+| [torchcrepe](https://github.com/maxrmorrison/torchcrepe) | 베이스 음표 · 편집 화면 음높이 선 | MIT |
 | [basic-pitch](https://github.com/spotify/basic-pitch) (Spotify) | 화음 악기 음표 읽기 | Apache-2.0 |
 | [pretty_midi](https://github.com/craffel/pretty-midi) | MIDI 파일 쓰기 | MIT |
 | [BS-Roformer SW](https://mvsep.com) (jarredou / MVSEP) | 6개 악기 분리 가중치 (처음 실행 때 내려받음) | 명시된 라이선스 없음 — 상업적으로 쓰려면 확인 필요 |
