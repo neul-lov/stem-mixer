@@ -571,7 +571,6 @@ async def create_job(mode: str = Form("ai"), url: str = Form(None), path: str = 
     if mode not in MODES:
         raise HTTPException(400, "mode")
     job_id = uuid.uuid4().hex
-    jobs[job_id] = {"status": "running", "step": "대기 중", "progress": 0.0}
     if url and url.strip():
         args = dict(text=url.strip(), force=bool(force))  # force: 노래가 아닌 것 같아도 나누기
     elif path:  # 같은 컴퓨터의 앱이 보내는 파일 경로
@@ -587,6 +586,8 @@ async def create_job(mode: str = Form("ai"), url: str = Form(None), path: str = 
         args = dict(upload_path=tmp, title=Path(file.filename).stem)
     else:
         raise HTTPException(400, "링크나 파일을 넣어 주세요")
+    # 입력을 다 확인한 뒤에 작업을 올린다 (잘못된 요청이 '작업 중'으로 남아 다른 작업을 막지 않게)
+    jobs[job_id] = {"status": "running", "step": "대기 중", "progress": 0.0}
     threading.Thread(target=run_job, args=(job_id, mode), kwargs=args, daemon=True).start()
     return {"job_id": job_id}
 
