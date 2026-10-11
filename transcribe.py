@@ -364,7 +364,7 @@ def _need(*packages):
 # ---------------------------------------------------------------- 보컬: GAME (OpenVPI)
 # https://github.com/openvpi/GAME — 분리된 노래를 악보로 만드는 전용 모델 (MIT). ONNX로 돌려서 onnxruntime만 있으면 된다.
 GAME_DIR = MODEL_DIR / "game"
-GAME_URL = None  # 모델 묶음(zip: config.json, encoder/segmenter/estimator/bd2dur.onnx)
+GAME_URL = "https://github.com/openvpi/GAME/releases/download/v1.0.3/GAME-1.0.3-medium-onnx.zip"  # 180MB, 공식 ONNX 묶음
 GAME_FILES = ("config.json", "encoder.onnx", "segmenter.onnx", "estimator.onnx", "bd2dur.onnx")
 
 
@@ -600,8 +600,11 @@ def piano_notes(y, progress=lambda p: None, step=lambda text: None):
 def transcribe(y, stem, progress=lambda p: None, curve=None, step=lambda text: None):
     if stem == "vocals":
         try:
-            notes = game_notes(y, progress, step)
+            notes = game_notes(y, lambda p: progress(0.6 * p if curve is not None else p), step)
             if notes is not None:
+                if curve is not None:  # 편집 화면의 음높이 선도 같이 (예전 방식은 음표 뽑으며 채웠다)
+                    step("음 높이를 읽는 중")
+                    curve.extend(pitch_curve(y, stem, lambda p: progress(0.6 + 0.4 * p)))
                 return notes
         except Exception:  # 모델을 못 받거나 못 돌리면 예전 방식으로
             traceback.print_exc()
