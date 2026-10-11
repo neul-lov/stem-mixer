@@ -138,6 +138,8 @@ struct Sidebar: View {
             Picker("분리 방식", selection: $model.mode) {
                 ForEach(SplitMode.picker) { Text($0.title).tag($0) }
             }
+            Toggle("최고 음질 (보컬 더 깨끗하게 · 두 배 느림)", isOn: $model.best)
+                .disabled(!model.mode.isHQ)
             Divider()
             Button("음악 파일 선택…") { model.chooseFile() }
             Button("저장 공간 관리…") { model.showStorage = true }
@@ -232,11 +234,18 @@ struct Sidebar: View {
                 .padding(2)
                 .background(Capsule().fill(Color.primary.opacity(0.06)))
 
+                if model.mode.isHQ {
+                    Toggle("최고 음질", isOn: $model.best.animation(.easeOut(duration: 0.15)))
+                        .toggleStyle(.checkbox)
+                        .font(.system(size: 11, weight: .medium))
+                        .help("보컬 모델을 하나 더 섞어 보컬이 더 깨끗해져요. 시간은 두 배쯤 걸려요.")
+                }
+
                 Spacer(minLength: 0)
 
                 CircleIconButton(icon: "doc.badge.plus", help: "음악 파일 선택") { model.chooseFile() }
             }
-            Text(model.mode.detail)
+            Text(model.splitMode.detail)
                 .font(.system(size: 10.5, weight: .medium))
                 .foregroundStyle(.secondary)
                 .padding(.leading, 4)
@@ -388,12 +397,12 @@ struct ResplitItems: View {
     @ObservedObject var model: AppModel
 
     var body: some View {
-        if item.mode == "hq" || item.mode == "hq6" {
+        if SplitMode(rawValue: item.mode)?.isHQ == true {
             Button("같은 방식으로 다시 분리 (최신 품질)") { model.redo(item) }
                 .disabled(model.job != nil)
             Divider()
         }
-        ForEach(SplitMode.picker.filter { $0.rawValue != item.mode }) { mode in
+        ForEach(SplitMode.resplit.filter { $0.rawValue != item.mode }) { mode in
             Button(model.version(of: item, mode: mode) == nil ? "\(mode.title)으로 다시 분리" : "\(mode.title) 버전 열기") {
                 model.resplit(item, mode: mode)
             }

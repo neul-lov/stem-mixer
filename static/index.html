@@ -103,6 +103,7 @@
     <div class="seg" id="mode">
       <button type="button" data-mode="hq" class="on">고음질 4트랙</button>
       <button type="button" data-mode="hq6">고음질 6트랙 (기타·피아노)</button>
+      <button type="button" data-mode="max">최고 음질 (느림)</button>
       <button type="button" data-mode="ai">빠르게</button>
     </div>
     <div class="hint" id="modeHint">AI가 악기 소리를 학습해서 깔끔하게 나눠요. 한 곡에 1~5분 정도 걸려요.</div>
@@ -166,10 +167,11 @@ const store = {
 };
 
 // ------------------------------------------------------------ 입력 & 분리 요청
-let mode = ["hq", "hq6", "ai"].includes(store.get("mode")) ? store.get("mode") : "hq";
+let mode = ["hq", "hq6", "max", "ai"].includes(store.get("mode")) ? store.get("mode") : "hq";
 const HINTS = {
   hq: "BS-Roformer SW로 나누고 남은 목소리까지 한 번 더 뽑아요. 4분 곡에 약 6~8분.",
   hq6: "같은 방식으로 기타·피아노까지 6개로 나눠요. 4분 곡에 약 8~10분.",
+  max: "고음질 4트랙에 보컬 모델을 하나 더 섞어 보컬이 더 깨끗해요. 4분 곡에 약 11~14분.",
   ai: "Demucs만 써서 빨라요 (4분 곡에 약 20초). 보컬이 조금 덜 깨끗해요.",
 };
 function setMode(m) {
@@ -409,11 +411,11 @@ async function loadLibrary() {
   $("lib").innerHTML = "";
   for (const s of songs) {
     const el = document.createElement("div"); el.className = "lib-item";
-    el.innerHTML = `<span class="name"></span><span class="tag">${{ hq: "고음질 4트랙", hq6: "고음질 6트랙", ai: "빠르게", ai6: "6트랙 (이전)", eq: "필터 (이전)" }[s.mode] || s.mode} · ${fmt(s.duration)}</span><button class="del">삭제</button>`;
+    el.innerHTML = `<span class="name"></span><span class="tag">${{ hq: "고음질 4트랙", hq6: "고음질 6트랙", max: "최고 음질 4트랙", max6: "최고 음질 6트랙", ai: "빠르게", ai6: "6트랙 (이전)", eq: "필터 (이전)" }[s.mode] || s.mode} · ${fmt(s.duration)}</span><button class="del">삭제</button>`;
     el.querySelector(".name").textContent = s.title;
     // 다른 방식으로 다시 분리 (이미 있으면 그 버전을 연다)
     const key = s.id.slice(0, s.id.lastIndexOf("-"));
-    for (const [m, label] of [["hq", "고음질 4트랙"], ["hq6", "고음질 6트랙"], ["ai", "빠르게"]]) {
+    for (const [m, label] of [["hq", "고음질 4트랙"], ["hq6", "고음질 6트랙"], ["max", "최고 음질 4트랙"], ["ai", "빠르게"]]) {
       if (m === s.mode) continue;
       const btn = document.createElement("button");
       const exists = songs.some(o => o.id === `${key}-${m}`);

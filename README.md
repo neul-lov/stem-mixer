@@ -116,8 +116,9 @@
 ## 분리 방식과 품질
 | 방식 | 하는 일 | 4분 곡 (Apple Silicon) |
 |---|---|---|
-| **고음질 4트랙** (기본) | BS-Roformer SW로 나누고 → 나머지 악기에 남은 목소리를 MelBand RoFormer로 한 번 더 뽑아 보컬로 → 베이스만 htdemucs_ft | 약 6~8분 |
+| **고음질 4트랙** (기본) | BS-Roformer SW로 나누고 → 나머지 악기에 남은 목소리를 MelBand RoFormer로 한 번 더 뽑아 보컬로 → 드럼 · 베이스는 SW와 htdemucs_ft를 섞기 | 약 6~8분 |
 | **고음질 6트랙** | 같은 방식 + 기타 · 피아노 (기타에 남은 목소리도 한 번 더 뽑기) | 약 8~10분 |
+| **최고 음질** ("최고 음질" 체크) | 고음질 + 보컬을 BS-Roformer revive v2로 한 번 더 뽑아 섞기 (4 · 6트랙 모두) | 약 2배 |
 | **빠르게** | Demucs htdemucs만 | 약 20초 |
 
 MUSDB18 테스트 곡 12개로 잰 점수 (SDR, dB, 높을수록 깨끗함)와 보컬을 끈 반주에 남는 목소리 (「ライラック」, 낮을수록 좋음):
@@ -127,9 +128,13 @@ MUSDB18 테스트 곡 12개로 잰 점수 (SDR, dB, 높을수록 깨끗함)와 �
 | 빠르게 (htdemucs) | 9.13 | 7.95 | 8.04 | 4.50 | 7.41 | — |
 | 이전 고음질 (RoFormer 보컬 + Demucs) | 11.98 | 9.44 | 8.67 | 6.06 | 9.04 | −43 dB |
 | BS-Roformer SW 단독 | 12.00 | 10.45 | 8.09 | 6.41 | 9.24 | −34 dB |
-| **지금 고음질** | 11.92 | **10.45** | **8.65** | 6.29 | **9.33** | **−66 dB** |
+| 이전 고음질 (SW + 남은 목소리 + 베이스만 htdemucs_ft) | 12.01 | 10.45 | 8.70 | 6.40 | 9.39 | −66 dB |
+| **지금 고음질** (드럼 0.85 SW + 0.15 ft, 베이스 0.35 SW + 0.65 ft) | 12.01 | 10.51 | 9.06 | 6.65 | 9.56 | |
+| **최고 음질** (보컬 0.4 고음질 + 0.6 revive v2) | **12.79** | **10.57** | **9.06** | **6.85** | **9.82** | |
 
-(6트랙의 기타 · 피아노는 MUSDB에 정답 트랙이 없어서 "나머지"에 합쳐서 쟀어요.)
+(6트랙의 기타 · 피아노는 MUSDB에 정답 트랙이 없어서 "나머지"에 합쳐서 쟀어요. 마지막 세 줄은 나머지를
+"원곡 − 다른 트랙"으로 세는 새 방식으로 다시 잰 점수예요. 섞는 비율도 이 12곡으로 정해서 다른 곡에서는 조금 덜 좋아질 수 있어요. 나머지 트랙은 원곡에서 다른 트랙을 뺀 소리라서
+트랙을 모두 더하면 언제나 원곡 그대로예요.)
 
 예전 "빠르게(주파수 필터)" 방식은 보컬에서 6kHz 이상을 잘라 버려서 먹먹했어요. 지금은 목록에 없고,
 그 방식으로 만든 예전 곡은 "다른 방식으로 분리"로 다시 나눌 수 있어요. 트랙은 24비트 FLAC으로 저장해요 (예전 곡은 wav).
@@ -161,6 +166,7 @@ MUSDB18 테스트 곡 12개로 잰 점수 (SDR, dB, 높을수록 깨끗함)와 �
 | [Whisper](https://github.com/openai/whisper) (mlx-whisper · faster-whisper) | 가사 받아 적기 | MIT |
 | [fugashi](https://github.com/polm/fugashi) · [unidic-lite](https://github.com/polm/unidic-lite) | 일본어 한자 → 가나 | MIT · BSD |
 | [BS-Roformer SW](https://mvsep.com) (jarredou / MVSEP) | 6개 악기 분리 가중치 (처음 실행 때 내려받음) | 명시된 라이선스 없음 — 상업적으로 쓰려면 확인 필요 |
+| [BS-Roformer revive v2 보컬 모델](https://huggingface.co/pcunwa) (unwa) | 최고 음질 보컬 가중치 (처음 쓸 때 내려받음) | 명시된 라이선스 없음 — 상업적으로 쓰려면 확인 필요 |
 | [python-audio-separator](https://github.com/nomadkaraoke/python-audio-separator) | RoFormer 모델 실행 | MIT |
 | [MelBand RoFormer 보컬 모델](https://github.com/KimberleyJensen/Mel-Band-Roformer-Vocal-Model) (Kimberley Jensen) | 보컬 분리 가중치 (처음 실행 때 내려받음, 저장소에 포함 안 됨) | 저장소에 명시된 라이선스 없음 — 상업적으로 쓰려면 확인 필요 |
 | [FFmpeg](https://ffmpeg.org) ([imageio-ffmpeg](https://github.com/imageio/imageio-ffmpeg)) | 오디오 변환 (설치할 때 내려받음, 저장소에 포함 안 됨) | LGPL/GPL |

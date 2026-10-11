@@ -70,18 +70,33 @@ struct TrackState {
 }
 
 enum SplitMode: String, CaseIterable, Identifiable {
-    /// hq / hq6: vocals by MelBand RoFormer, instruments by Demucs (best quality).
+    /// hq / hq6: BS-Roformer SW + RoFormer vocals + Demucs (high quality).
+    /// max / max6: the same with a second vocal model blended in (cleaner vocals, about twice as slow).
     /// ai: Demucs only (fast). ai6 / eq: older modes, kept so earlier songs still show a label.
-    case hq, hq6, ai, ai6, eq
+    case hq, hq6, max, max6, ai, ai6, eq
     var id: String { rawValue }
 
     /// The modes offered for new separations.
     static let picker: [SplitMode] = [.hq, .hq6, .ai]
+    /// The modes offered for separating a song again.
+    static let resplit: [SplitMode] = [.hq, .hq6, .max, .max6, .ai]
+
+    /// The same mode with the second vocal model ("최고 음질") on or off.
+    func best(_ on: Bool) -> SplitMode {
+        switch self {
+        case .hq, .max: on ? .max : .hq
+        case .hq6, .max6: on ? .max6 : .hq6
+        default: self
+        }
+    }
+    var isHQ: Bool { [.hq, .hq6, .max, .max6].contains(self) }
 
     var title: String {
         switch self {
         case .hq: "고음질 4트랙"
         case .hq6: "고음질 6트랙"
+        case .max: "최고 음질 4트랙"
+        case .max6: "최고 음질 6트랙"
         case .ai: "빠르게"
         case .ai6: "6트랙 (이전)"
         case .eq: "필터 (이전)"
@@ -91,6 +106,8 @@ enum SplitMode: String, CaseIterable, Identifiable {
         switch self {
         case .hq: "보컬 · 베이스 · 드럼 · 나머지 악기 · 4분 곡에 약 6~8분"
         case .hq6: "보컬 · 베이스 · 드럼 · 기타 · 피아노 · 나머지 · 4분 곡에 약 8~10분"
+        case .max: "보컬 모델을 하나 더 섞어 보컬이 더 깨끗해요 · 4분 곡에 약 11~14분"
+        case .max6: "6트랙 + 보컬 모델 하나 더 · 4분 곡에 약 14~16분"
         case .ai: "보컬이 조금 덜 깨끗해요 · 4분 곡에 약 20초"
         case .ai6: "기타 · 피아노까지 6개 (이전 방식)"
         case .eq: "주파수로만 자른 이전 방식이라 먹먹해요"
@@ -127,6 +144,12 @@ final class AppModel: ObservableObject {
         .flatMap { SplitMode.picker.contains($0) ? $0 : nil } ?? .hq {
         didSet { UserDefaults.standard.set(mode.rawValue, forKey: "mode") }
     }
+    /// "최고 음질": a second vocal model is blended in (hq → max, hq6 → max6).
+    @Published var best = UserDefaults.standard.bool(forKey: "best") {
+        didSet { UserDefaults.standard.set(best, forKey: "best") }
+    }
+    /// The mode new separations use.
+    var splitMode: SplitMode { mode.best(best) }
     @Published var job: Job?
     @Published var jobError: String? { didSet { if jobError == nil { splitAnyway = nil } } }
     /// Set when the last link didn't look like a song: sends it again without the check.
@@ -207,7 +230,7 @@ final class AppModel: ObservableObject {
     func submit() {
         let text = input.trimmingCharacters(in: .whitespacesAndNewlines)
         guard canSubmit, !text.isEmpty else { return }
-        let mode = self.mode.rawValue
+        let mode = splitMode.rawValue
         run(label: text, anyway: { [weak self] in
             guard let self, self.server == .ready, self.job == nil else { return }
             self.run(label: text) { try await self.backend.startJob(text: text, mode: mode, force: true) }
@@ -217,7 +240,7 @@ final class AppModel: ObservableObject {
     func submit(file: URL) {
         guard server == .ready, job == nil else { return }
         run(label: file.deletingPathExtension().lastPathComponent) {
-            try await self.backend.startJob(file: file, mode: self.mode.rawValue)
+            try await self.backend.startJob(file: file, mode: self.splitMode.rawValue)
         }
     }
 

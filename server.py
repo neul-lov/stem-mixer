@@ -52,7 +52,7 @@ SR = 44100
 STEMS = ["vocals", "bass", "drums", "other"]
 STEMS_6 = ["vocals", "bass", "drums", "guitar", "piano", "other"]  # ai6 모드 (기타·피아노 추가)
 MODELS = {"ai": "htdemucs", "ai6": "htdemucs_6s"}  # 빠른 AI (Demucs만)
-MODES = ("hq", "hq6", "ai", "ai6", "eq")  # hq/hq6 = 최고 품질 (RoFormer 보컬 + Demucs)
+MODES = ("hq", "hq6", "max", "max6", "ai", "ai6", "eq")  # hq/hq6 = 고음질, max/max6 = 보컬 모델을 하나 더 섞은 최고 음질 (두 배 느림)
 
 app = FastAPI()
 LOCAL_HOSTS = {"127.0.0.1", "localhost", "[::1]"}
@@ -349,37 +349,46 @@ def roformer_vocals(x, job, p0, p1):
 
 
 SW_MODEL = "BS-Roformer-SW.ckpt"  # 6개 악기를 한 번에 (MVSEP 기본 모델)
+BEST_VOCAL_MODEL = "bs_roformer_vocals_revive_v2_unwa.ckpt"  # 최고 음질: 보컬을 한 번 더 (unwa)
 
 
-def separate_hq(x, job, six=False):
-    """최고 품질 조합 (MUSDB18 테스트 12곡 평균 SDR 9.33, 보컬 끈 반주에 남는 목소리 −66 dB):
+def separate_hq(x, job, six=False, best=False):
+    """최고 품질 조합 (MUSDB18 테스트 12곡 평균 SDR 9.56, best=True면 9.82):
     1) BS-Roformer SW로 보컬 · 드럼 · 베이스 · 기타 · 피아노 · 나머지를 한 번에 나누고
     2) "나머지 악기"에 남은 목소리를 MelBand RoFormer로 한 번 더 뽑아 보컬로 옮기고
-    3) 베이스만 htdemucs_ft로 바꾼다 (베이스는 htdemucs_ft가 더 잘한다: 8.65 vs 8.09)."""
-    o = run_separator(SW_MODEL, x, job, 0.0, 0.55, 0.85, "악기 6개로 나누는 중 (BS-Roformer SW)",
+    3) (best) 보컬을 BS-Roformer revive v2 보컬과 섞고 (보컬 12.01 → 12.79, 시간은 두 배)
+    4) 드럼 · 베이스는 SW와 htdemucs_ft를 섞는다 (드럼 10.45 → 10.51, 베이스 8.70 → 9.06).
+    나머지는 원곡에서 다른 트랙을 뺀 소리라서 트랙을 모두 더하면 원곡 그대로다."""
+    a = 0.45 if best else 0.55  # SW가 끝나는 진행률
+    o = run_separator(SW_MODEL, x, job, 0.0, a, 0.85, "악기 6개로 나누는 중 (BS-Roformer SW)",
                       "분리 AI 모델 불러오는 중" if (MODEL_DIR / SW_MODEL).exists()
                       else "분리 AI 모델 받는 중 (처음 한 번만 약 700MB)")
     # SW가 놓친 목소리는 주로 나머지 악기에, 곡에 따라 기타에도 남는다 (실제 곡에서 기타 트랙의 18%가 목소리).
     # 그 트랙들에서 한 번 더 뽑아 보컬로 옮긴다. 4트랙은 셋을 합친 소리에서 한 번에.
     vocals = o["vocals"]
+    b = a + (0.82 - a) * (0.5 if best else 1.0)  # 남은 목소리 뽑기가 끝나는 진행률
     if six:
         cleaned = {}
         for i, st in enumerate(("other", "guitar")):
             job["step"] = "남은 목소리를 한 번 더 뽑는 중"
-            left = roformer_vocals(o[st], job, 0.55 + 0.13 * i, 0.68 + 0.13 * i)
+            left = roformer_vocals(o[st], job, a + (b - a) * i / 2, a + (b - a) * (i + 1) / 2)
             vocals, cleaned[st] = vocals + left, o[st] - left
-        other, guitar = cleaned["other"], cleaned["guitar"]
+        guitar = cleaned["guitar"]
     else:
         job["step"] = "남은 목소리를 한 번 더 뽑는 중"
-        rest = o["other"] + o["guitar"] + o["piano"]
-        left = roformer_vocals(rest, job, 0.55, 0.8)
-        vocals, other = vocals + left, rest - left
-    job["step"] = "남은 목소리를 한 번 더 뽑는 중"
-    ft = demucs_split(x - vocals, job, "htdemucs_ft", 0.82, 1.0, "베이스를 나누는 중")
-    other = other + o["bass"] - ft["bass"]  # 베이스를 바꿔도 전체 합은 그대로
-    out = {"vocals": vocals, "drums": o["drums"], "bass": ft["bass"], "other": other}
+        vocals = vocals + roformer_vocals(o["other"] + o["guitar"] + o["piano"], job, a, b)
+    if best:
+        rv = run_separator(BEST_VOCAL_MODEL, x, job, b, 0.82, 1.5, "보컬을 한 번 더 뽑아 섞는 중",
+                           "보컬 AI 모델 불러오는 중" if (MODEL_DIR / BEST_VOCAL_MODEL).exists()
+                           else "보컬 AI 모델 받는 중 (처음 한 번만 약 700MB)")
+        vocals = 0.4 * vocals + 0.6 * rv["vocals"]
+    ft = demucs_split(x - vocals, job, "htdemucs_ft", 0.82, 1.0, "드럼 · 베이스를 다듬는 중")
+    drums = 0.85 * o["drums"] + 0.15 * ft["drums"]
+    bass = 0.35 * o["bass"] + 0.65 * ft["bass"]
+    out = {"vocals": vocals, "drums": drums, "bass": bass}
     if six:
         out.update(guitar=guitar, piano=o["piano"])
+    out["other"] = x - sum(out.values())
     return out
 
 
@@ -492,13 +501,13 @@ def run_job(job_id, mode, text=None, upload_path=None, title=None, resplit=None,
                     raise
                 except Exception:  # 확인하는 모델을 못 받거나 못 돌리면 막지 않고 그냥 나눈다
                     traceback.print_exc()
-            if mode in ("hq", "hq6"):
-                stems = separate_hq(x, job, six=mode == "hq6")
+            if mode in ("hq", "hq6", "max", "max6"):
+                stems = separate_hq(x, job, six=mode.endswith("6"), best=mode.startswith("max"))
             elif mode in MODELS:
                 stems = separate_ai(x, job, mode)
             else:
                 stems = separate_eq(x, job)
-            names = STEMS_6 if mode in ("ai6", "hq6") else STEMS
+            names = STEMS_6 if mode in ("ai6", "hq6", "max6") else STEMS
             job.update(step="저장 중", progress=0.99)
             peak = max(float(np.abs(s).max()) for s in stems.values())
             scale = 0.99 / peak if peak > 0.99 else 1.0
