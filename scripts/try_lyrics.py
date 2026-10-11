@@ -23,7 +23,7 @@ print(" ".join(w for _, _, w in words)[:1500])
 midi = folder / "midi" / "vocals.json"
 if midi.exists():
     d = json.loads(midi.read_text())
-    notes = d.get("notes", d["raw"])
+    notes = d.get("notes") or d["raw"]
     out, placed, dropped = ly.fit(notes, words, lang)
     print(f"음표 {len(notes)}개 → {len(out)}개, 가사 붙은 음표 {placed}개, 못 붙인 음절 {dropped}개")
     print(" ".join(n[4] if len(n) > 4 else "·" for n in out[:120]))

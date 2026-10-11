@@ -148,7 +148,7 @@ def _reading(w):
 
 def to_kana(text):
     """일본어 문장의 한자를 히라가나로."""
-    return "".join(_reading(w) for w in _tagger()(text))
+    return "".join(w.white_space + _reading(w) for w in _tagger()(text))
 
 
 def syllables(text, language, kana=False):
@@ -206,11 +206,23 @@ def word_units(ws, language):
             covered = list(dict.fromkeys(owner[a:b]))
             if not units or not covered:
                 continue
-            # 낱말의 음절을 그 낱말이 걸친 말 조각들에 글자 수만큼 나눠 준다
-            sizes = [owner[a:b].count(i) for i in covered]
-            total, u = sum(sizes), 0
+            # 낱말의 음절을 그 낱말이 걸친 말 조각들에 나눠 준다. 가나로 된 조각은 제 음절 수만큼(思 / い / 出 / す →
+            # おも / い / だ / す), 남는 음절은 한자 조각들에 글자 수만큼
+            parts = ["".join(c for c, o in zip(text[a:b], owner[a:b]) if o == i) for i in covered]
+            fixed = [len(syllables(_hira(p), "ja", kana=True)) if p and all(_is_kana(c) or c in _NOT_NOTES for c in p)
+                     else None for p in parts]
+            rest = len(units) - sum(n for n in fixed if n is not None)
+            free = [j for j, n in enumerate(fixed) if n is None]
+            if rest < len(free) or (not free and rest):  # 맞지 않으면 글자 수만큼
+                fixed, free, rest = [None] * len(parts), list(range(len(parts))), len(units)
+            sizes = {j: len(parts[j]) for j in free}
+            total, given = sum(sizes.values()) or 1, 0
+            for k, j in enumerate(free):
+                fixed[j] = rest - given if k == len(free) - 1 else max(1, round(rest * sizes[j] / total))
+                given += fixed[j]
+            u = 0
             for j, i in enumerate(covered):
-                take = len(units) - u if j == len(covered) - 1 else round(len(units) * sizes[j] / total)
+                take = len(units) - u if j == len(covered) - 1 else fixed[j]
                 out[i][2] += units[u:u + take]
                 u += take
     return [tuple(x) for x in out]
