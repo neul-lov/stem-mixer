@@ -353,11 +353,11 @@ BEST_VOCAL_MODEL = "bs_roformer_vocals_revive_v2_unwa.ckpt"  # 최고 음질: �
 
 
 def separate_hq(x, job, six=False, best=False):
-    """최고 품질 조합 (MUSDB18 테스트 12곡 평균 SDR 9.56, best=True면 9.82):
+    """최고 품질 조합 (MUSDB18 테스트 12곡 평균 SDR 9.59, best=True면 9.82):
     1) BS-Roformer SW로 보컬 · 드럼 · 베이스 · 기타 · 피아노 · 나머지를 한 번에 나누고
     2) "나머지 악기"에 남은 목소리를 MelBand RoFormer로 한 번 더 뽑아 보컬로 옮기고
     3) (best) 보컬을 BS-Roformer revive v2 보컬과 섞고 (보컬 12.01 → 12.79, 시간은 두 배)
-    4) 드럼 · 베이스는 SW와 htdemucs_ft를 섞는다 (드럼 10.45 → 10.51, 베이스 8.70 → 9.06).
+    4) 드럼 · 베이스는 SW와 htdemucs_ft를 섞는다 (드럼 10.45 → 10.57, 베이스 8.70 → 9.06).
     나머지는 원곡에서 다른 트랙을 뺀 소리라서 트랙을 모두 더하면 원곡 그대로다."""
     a = 0.45 if best else 0.55  # SW가 끝나는 진행률
     o = run_separator(SW_MODEL, x, job, 0.0, a, 0.85, "악기 6개로 나누는 중 (BS-Roformer SW)",

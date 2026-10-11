@@ -18,3 +18,4 @@ mac/.build/
 .DS_Store
 models/
 .bin/
+*.whl
