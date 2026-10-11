@@ -778,7 +778,8 @@ def run_transcribe(job_id, song_id, stem, sound, snap):
             y = audiofile.read(folder / "user" if mine else folder, stem)
             job["step"] = ("음 높이를 읽는 중" if stem in tr.MONO_STEMS else "화음을 읽는 중 (basic-pitch)")
             curve = []
-            raw = tr.transcribe(y, stem, lambda p: job.update(progress=0.05 + 0.75 * p), curve=curve)
+            raw = tr.transcribe(y, stem, lambda p: job.update(progress=0.05 + 0.75 * p), curve=curve,
+                                step=lambda text: job.update(step=text))
             if curve:  # 편집 화면의 음높이 선 (한 번 읽은 김에)
                 save_pitch(folder, meta, stem, curve)
             job.update(step="조성과 빠르기 찾는 중", progress=0.85)

@@ -1,18 +1,26 @@
 """트랙의 음정을 읽어서 음표(MIDI)로 만들고, 깔끔한 소리로 다시 연주한다.
 
-- 한 음씩 나오는 파트(보컬, 베이스): torchcrepe로 음 높이를 10ms마다 읽고 음표로 나눈다.
-- 화음 파트(피아노, 기타, 나머지): Spotify basic-pitch (ONNX).
+- 보컬: GAME (OpenVPI, ONNX) — 분리된 노래를 악보로 만드는 전용 모델. 못 쓰면 아래 torchcrepe 방식.
+- 베이스: torchcrepe로 음 높이를 10ms마다 읽고 음표로 나눈다.
+- 피아노: ByteDance 피아노 채보 모델 (Kong et al. 2021).
+- 나머지 화음 파트(기타, 나머지): Spotify basic-pitch (ONNX).
 - 다시 연주는 내장 신스(피아노풍 · 신스 리드 · 사인 · 스트링)로 해서 사운드폰트가 필요 없다.
 """
 import json
 import math
+import subprocess
+import sys
 import tempfile
+import traceback
+import urllib.request
+import zipfile
 from pathlib import Path
 
 import numpy as np
 import soundfile as sf
 
 SR = 44100
+MODEL_DIR = Path(__file__).parent / "models"
 MONO_STEMS = ("vocals", "bass")
 PITCH_MODEL = "tiny"  # torchcrepe tiny: 테스트에서 full보다 빠르고 정확했다. "fcpe"는 더 빠르지만 다른 소리가 섞이면 덜 정확
 SOUNDS = ("piano", "lead", "sine", "strings")
@@ -321,7 +329,289 @@ def synth(notes, n_frames, sound="piano"):
     return np.stack([out, out], axis=1)
 
 
-def transcribe(y, stem, progress=lambda p: None, curve=None):
+# ---------------------------------------------------------------- 모델 받기
+def _download(url, dest, progress=lambda p: None):
+    """처음 한 번 모델 파일을 받는다. 다 받은 뒤에 이름을 바꿔서, 중간에 끊겨도 반쪽 파일이 남지 않게."""
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_name(f".{dest.name}.part")
+    try:
+        with urllib.request.urlopen(url, timeout=60) as r, open(tmp, "wb") as f:
+            total = int(r.headers.get("Content-Length") or 0)
+            done = 0
+            while chunk := r.read(1 << 20):
+                f.write(chunk)
+                done += len(chunk)
+                if total:
+                    progress(done / total)
+        tmp.replace(dest)
+    finally:
+        tmp.unlink(missing_ok=True)
+    return dest
+
+
+def _need(*packages):
+    """예전에 설치한 앱에는 없는 파이썬 패키지를 그 자리에서 설치한다 (처음 한 번)."""
+    import importlib
+    import importlib.util
+
+    missing = [pip for mod, pip in packages if importlib.util.find_spec(mod) is None]
+    if missing:
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q", *missing], check=True)
+        importlib.invalidate_caches()
+
+
+# ---------------------------------------------------------------- 보컬: GAME (OpenVPI)
+# https://github.com/openvpi/GAME — 분리된 노래를 악보로 만드는 전용 모델 (MIT). ONNX로 돌려서 onnxruntime만 있으면 된다.
+GAME_DIR = MODEL_DIR / "game"
+GAME_URL = None  # 모델 묶음(zip: config.json, encoder/segmenter/estimator/bd2dur.onnx)
+GAME_FILES = ("config.json", "encoder.onnx", "segmenter.onnx", "estimator.onnx", "bd2dur.onnx")
+
+
+def _game_dir():
+    if GAME_DIR.exists():
+        for c in sorted(GAME_DIR.rglob("config.json")):
+            if all((c.parent / f).is_file() for f in GAME_FILES):
+                return c.parent
+    return None
+
+
+def game_ready():
+    return _game_dir() is not None or bool(GAME_URL)
+
+
+class _Game:
+    def __init__(self, folder):
+        import onnxruntime as ort
+
+        self.config = json.loads((folder / "config.json").read_text())
+        opts = ort.SessionOptions()
+        opts.log_severity_level = 3
+
+        def load(name):
+            return ort.InferenceSession(str(folder / name), opts, providers=["CPUExecutionProvider"])
+
+        self.encoder, self.segmenter = load("encoder.onnx"), load("segmenter.onnx")
+        self.estimator, self.bd2dur = load("estimator.onnx"), load("bd2dur.onnx")
+        self.sr = int(self.config.get("samplerate", SR))
+        self.timestep = float(self.config.get("timestep", 0.01))
+        self.loop = bool(self.config.get("loop"))
+        self.seg_inputs = {i.name for i in self.segmenter.get_inputs()}
+
+    def run(self, wav, language=0, steps=8, seg_threshold=0.2, radius=0.02, est_threshold=0.2):
+        """wav(모노 float32, self.sr) 한 조각 → [(시작초, 길이초, MIDI 음(소수))] 소리 나는 음표만."""
+        x_seg, x_est, mask = self.encoder.run(None, {
+            "waveform": wav[None].astype(np.float32), "duration": np.array([len(wav) / self.sr], np.float32)})
+        known = np.zeros(mask.shape, bool)
+        feeds = {"x_seg": x_seg, "known_boundaries": known, "maskT": mask,
+                 "threshold": np.array(seg_threshold, np.float32),
+                 "radius": np.array(round(radius / self.timestep), np.int64),
+                 "language": np.array([language], np.int64)}
+        bounds = known
+        # D3PM: 경계를 몇 번에 걸쳐 다듬는다 (t = 0, 1/8, … 7/8; GAME 기본값)
+        for t in ([i / steps for i in range(steps)] if self.loop else [None]):
+            if t is not None:
+                feeds.update(prev_boundaries=bounds, t=np.array([t], np.float32))
+            bounds = self.segmenter.run(None, {k: v for k, v in feeds.items() if k in self.seg_inputs})[0]
+        durations, mask_n = self.bd2dur.run(None, {"boundaries": bounds, "maskT": mask})
+        presence, scores = self.estimator.run(None, {
+            "x_est": x_est, "boundaries": bounds, "maskT": mask, "maskN": mask_n,
+            "threshold": np.array(est_threshold, np.float32)})
+        out, t = [], 0.0
+        for d, ok, s, valid in zip(durations[0], presence[0], scores[0], mask_n[0]):
+            if not valid:
+                break
+            if ok:
+                out.append((t, float(d), float(s)))
+            t += float(d)
+        return out
+
+
+def _get_game(step=lambda text: None, progress=lambda p: None):
+    global _game
+    try:
+        return _game
+    except NameError:
+        pass
+    folder = _game_dir()
+    if folder is None and GAME_URL:
+        step("노래 음표 AI 모델 받는 중 (처음 한 번)")
+        z = _download(GAME_URL, MODEL_DIR / "game.zip", progress)
+        try:
+            with zipfile.ZipFile(z) as f:
+                f.extractall(GAME_DIR)
+        finally:
+            z.unlink(missing_ok=True)
+        folder = _game_dir()
+    if folder is None:
+        return None
+    _need(("onnxruntime", "onnxruntime"))
+    _game = _Game(folder)
+    return _game
+
+
+def _sing_chunks(m, sr, max_len=30.0):
+    """노래를 쉬는 곳(0.2초 넘게 -40dB 아래)에서 조각낸다: [(시작 샘플, 끝 샘플)]. GAME도 이렇게 잘라서 읽는다.
+    한 조각이 max_len초를 넘으면 그 안에서 가장 조용한 곳에서 한 번 더 자른다."""
+    hop = sr // 100
+    n = len(m) // hop
+    if n == 0:
+        return []
+    rms = np.sqrt((m[: n * hop].reshape(n, hop) ** 2).mean(axis=1))
+    loud = rms >= 10 ** (-40 / 20)
+    # 소리 나는 구간을 찾고, 0.2초보다 짧게 쉬는 곳은 이어 붙인다
+    spans, i = [], 0
+    while i < n:
+        if not loud[i]:
+            i += 1
+            continue
+        j = i
+        while j < n and loud[j]:
+            j += 1
+        if spans and i - spans[-1][1] < 20:
+            spans[-1][1] = j
+        else:
+            spans.append([i, j])
+        i = j
+    out = []
+    for a, b in spans:
+        a, b = max(0, a - 10), min(n, b + 10)  # 앞뒤로 0.1초 여유
+        if out and a < out[-1][1]:
+            out[-1][1] = b
+            continue
+        out.append([a, b])
+    # 1초도 안 되는 조각은 다음 조각과 붙인다 (너무 짧으면 음 경계를 잘 못 찾는다)
+    merged = []
+    for a, b in out:
+        if merged and merged[-1][1] - merged[-1][0] < 100 and b - merged[-1][0] <= max_len * 100:
+            merged[-1][1] = b
+        else:
+            merged.append([a, b])
+    limit = int(max_len * 100)
+    final = []
+    for a, b in merged:
+        while b - a > limit:
+            lo = a + limit // 2
+            cut = lo + int(np.argmin(rms[lo:a + limit]))
+            final.append((a * hop, cut * hop))
+            a = cut
+        final.append((a * hop, min(len(m), b * hop)))
+    return final
+
+
+def game_notes(y, progress=lambda p: None, step=lambda text: None):
+    """GAME으로 보컬 음표: (시작초, 끝초, MIDI 음, 세기 0~1). 모델이 없으면 None."""
+    g = _get_game(step, lambda p: progress(0.3 * p))
+    if g is None:
+        return None
+    step("노래 음표 읽는 중 (GAME)")
+    m = y.mean(axis=1).astype(np.float32)
+    if g.sr != SR:
+        import librosa
+        m = librosa.resample(m, orig_sr=SR, target_sr=g.sr)
+    language = 0  # 0 = 언어 구분 없이 (한국어는 모델이 따로 알지 못한다)
+    chunks = _sing_chunks(m, g.sr)
+    total = sum(b - a for a, b in chunks) or 1
+    done, raw = 0, []
+    for a, b in chunks:
+        for s, d, p in g.run(m[a:b], language):
+            raw.append((a / g.sr + s, a / g.sr + s + d, p))
+        done += b - a
+        progress(0.3 + 0.7 * done / total)
+    # 세기: 그 음표 구간의 소리 크기 (가장 큰 소리보다 40dB 작으면 0.2)
+    frame = g.sr // 100
+    n = len(m) // frame
+    db = 20 * np.log10(np.sqrt((m[: n * frame].reshape(n, frame) ** 2).mean(axis=1)) + 1e-9) if n else np.zeros(1)
+    top = db.max()
+    out = []
+    for s, e, p in raw:
+        if e - s < 0.05 or not math.isfinite(p):
+            continue
+        seg = db[int(s * 100):max(int(s * 100) + 1, int(e * 100))]
+        vel = float(np.clip((seg.mean() - top + 40) / 40 if len(seg) else 0.5, 0.2, 1.0))
+        out.append((round(s, 3), round(e, 3), int(np.clip(round(p), 0, 127)), round(vel, 3)))
+    progress(1.0)
+    return out
+
+
+# ---------------------------------------------------------------- 피아노: ByteDance 피아노 채보
+# Kong et al., "High-resolution Piano Transcription with Pedals by Regressing Onset and Offset Times" (MIT)
+PIANO_CKPT = MODEL_DIR / "piano_note_pedal.pth"
+PIANO_URL = "https://zenodo.org/record/4034264/files/CRNN_note_F1%3D0.9677_pedal_F1%3D0.9186.pth?download=1"
+
+
+def piano_notes(y, progress=lambda p: None, step=lambda text: None):
+    import os
+
+    os.environ.setdefault("MPLBACKEND", "Agg")  # 모델 코드가 matplotlib을 불러온다 (창은 안 띄운다)
+    import torch
+    import torchaudio
+
+    _need(("piano_transcription_inference", "piano_transcription_inference"), ("torchlibrosa", "torchlibrosa"),
+          ("matplotlib", "matplotlib"), ("mido", "mido"))
+    from piano_transcription_inference.models import Note_pedal
+    from piano_transcription_inference.utilities import RegressionPostProcessor
+
+    global _piano
+    try:
+        _piano
+    except NameError:
+        if not PIANO_CKPT.exists() or PIANO_CKPT.stat().st_size < 1.6e8:
+            step("피아노 AI 모델 받는 중 (처음 한 번, 165MB)")
+            _download(PIANO_URL, PIANO_CKPT, lambda p: progress(0.3 * p))
+        model = Note_pedal(frames_per_second=100, classes_num=88)
+        model.load_state_dict(torch.load(PIANO_CKPT, map_location="cpu", weights_only=True)["model"], strict=False)
+        model.eval()
+        _piano = model
+    step("피아노 음표 읽는 중")
+    model = _piano
+    x = torch.from_numpy(y.mean(axis=1).astype(np.float32))[None]
+    audio = torchaudio.functional.resample(x, SR, 16000)[0].numpy()
+    seg = 16000 * 10  # 10초 조각을 5초씩 겹쳐서 (원래 코드와 같게)
+    n = len(audio)
+    audio = np.pad(audio, (0, int(np.ceil(max(n, 1) / seg)) * seg - n))
+    starts = list(range(0, len(audio) - seg + 1, seg // 2))
+    outs = {}
+    with torch.no_grad():
+        for k, i in enumerate(starts):
+            o = model(torch.from_numpy(audio[None, i:i + seg]))
+            for key, v in o.items():
+                outs.setdefault(key, []).append(v[0].numpy())
+            progress(0.3 + 0.65 * (k + 1) / len(starts))
+    joined = {}
+    for key, parts in outs.items():
+        if len(parts) == 1:
+            joined[key] = parts[0][:n // 160 + 1]
+            continue
+        parts = [p[:-1] for p in parts]  # 조각 끝의 한 프레임은 덧붙은 것
+        L = parts[0].shape[0]
+        pieces = [parts[0][:int(L * 0.75)]] + [p[int(L * 0.25):int(L * 0.75)] for p in parts[1:-1]] + \
+                 [parts[-1][int(L * 0.25):]]
+        joined[key] = np.concatenate(pieces)[:n // 160 + 1]
+    post = RegressionPostProcessor(100, classes_num=88, onset_threshold=0.3, offset_threshold=0.3,
+                                   frame_threshold=0.1, pedal_offset_threshold=0.2)
+    notes, _pedal = post.output_dict_to_midi_events(joined)
+    progress(1.0)
+    return sorted((round(float(e["onset_time"]), 3), round(float(e["offset_time"]), 3), int(e["midi_note"]),
+                   float(np.clip(e["velocity"] / 127, 0.15, 1.0))) for e in notes
+                  if e["offset_time"] - e["onset_time"] >= 0.03)
+
+
+def transcribe(y, stem, progress=lambda p: None, curve=None, step=lambda text: None):
+    if stem == "vocals":
+        try:
+            notes = game_notes(y, progress, step)
+            if notes is not None:
+                return notes
+        except Exception:  # 모델을 못 받거나 못 돌리면 예전 방식으로
+            traceback.print_exc()
+        step("음 높이를 읽는 중")
+    if stem == "piano":
+        try:
+            return piano_notes(y, progress, step)
+        except Exception:
+            traceback.print_exc()
+            step("화음을 읽는 중 (basic-pitch)")
     if stem in MONO_STEMS:
         fmin, fmax = pitch_range(stem)
         return mono_notes(y, progress, fmin=fmin, fmax=fmax, curve=curve)
