@@ -15,6 +15,7 @@ import numpy as np
 SR = 44100
 LANGUAGES = {"auto": None, "ko": "ko", "ja": "ja", "en": "en", "zh": "zh"}
 EXTEND = "+"
+MIN_NOTE = 0.06  # transcribe.clean_notes(내보내기)가 이보다 짧은 음표를 뺀다
 # 아무 소리 없는 곳에서 Whisper가 자주 지어내는 말 (방송 자막에서 배운 것)
 _HALLUCINATIONS = re.compile(
     r"ご視聴|チャンネル登録|字幕|시청해\s*주셔서|구독과\s*좋아요|MBC|KBS|SBS|뉴스|Thank(s| you) for watching|"
@@ -45,7 +46,7 @@ def _model(step):
         def run(audio, language):
             r = mlx_whisper.transcribe(audio, path_or_hf_repo=path, language=language, word_timestamps=True,
                                        condition_on_previous_text=False, verbose=None, fp16=True)
-            return r.get("language"), [w for s in r.get("segments", []) for w in s.get("words", [])]
+            return r.get("language"), [s.get("words") or [] for s in r.get("segments", [])]
     else:
         tr._need(("faster_whisper", "faster-whisper"))
         from faster_whisper import WhisperModel
@@ -56,9 +57,8 @@ def _model(step):
         def run(audio, language):
             segs, info = model.transcribe(audio, language=language, word_timestamps=True,
                                           condition_on_previous_text=False, vad_filter=False, beam_size=5)
-            words = [{"word": w.word, "start": w.start, "end": w.end, "probability": w.probability}
-                     for s in segs for w in (s.words or [])]
-            return info.language, words
+            segments = [[{"word": w.word, "start": w.start, "end": w.end} for w in (s.words or [])] for s in segs]
+            return info.language, segments
     _whisper = run
     return run
 
@@ -86,32 +86,35 @@ def words(y, language=None, progress=lambda p: None, step=lambda text: None):
     done, out = 0, []
     for i in order:
         a, b = chunks[i]
-        lang, ws = run(a16[a:b], language)
+        lang, segments = run(a16[a:b], language)
         language = language or lang
-        for w in ws:
-            text = (w.get("word") or "").strip()
-            if not text or w.get("start") is None or w.get("end") is None:
+        for seg in segments:
+            # 지어낸 줄(방송 자막 인사 등)은 그 줄을 통째로 뺀다. 말을 띄어 붙이고 띄어쓰기 없이도 본다 (시청해 / 주셔서)
+            joined = " ".join((w.get("word") or "").strip() for w in seg)
+            if _HALLUCINATIONS.search(joined) or _HALLUCINATIONS.search(joined.replace(" ", "")):
                 continue
-            out.append((a / 16000 + float(w["start"]), a / 16000 + float(w["end"]), text))
+            for w in seg:
+                text = (w.get("word") or "").strip()
+                if not text or w.get("start") is None or w.get("end") is None:
+                    continue
+                out.append((a / 16000 + float(w["start"]), a / 16000 + float(w["end"]), text))
         done += b - a
         progress(done / total)
     out.sort()
-    text = "".join(w for _, _, w in out)
-    if _HALLUCINATIONS.search(text):  # 지어낸 줄은 통째로 뺀다
-        out = [w for w in out if not _HALLUCINATIONS.search(w[2])]
     return language or "ko", out
 
 
 # ---------------------------------------------------------------- 음절 나누기
 _SMALL = set("ぁぃぅぇぉゃゅょゎゕゖ")
+_NOT_NOTES = set("っッーゝゞヽヾ・゛゜々")
 
 
 def _hira(text):
     return "".join(chr(ord(c) - 0x60) if "ァ" <= c <= "ヶ" else c for c in text)
 
 
-def _is_kana(c):
-    return "぀" <= c <= "ヿ"
+def _is_kana(c):  # 히라가나 ぁ–ゖ, 가타카나 ァ–ヺ (・ 같은 기호와 ゛゜는 빼고)
+    return "\u3041" <= c <= "\u3096" or "\u30a1" <= c <= "\u30fa"
 
 
 def _is_syllable_char(c):
@@ -154,13 +157,13 @@ def syllables(text, language, kana=False):
         text = to_kana(text)
     out, word = [], ""
     for c in text:
-        if not _is_syllable_char(c) and (c.isalnum() or c in "'’"):
+        if not _is_syllable_char(c) and (c.isalnum() or c in "'’") and c not in _NOT_NOTES:
             word += c
             continue
         if word:
             out.append(word)
             word = ""
-        if not _is_syllable_char(c) or c in "っッーゝゞ":  # 띄어쓰기 · 문장부호 · 작은 っ · 길게 늘이는 ー는 음표가 아니다
+        if not _is_syllable_char(c) or c in _NOT_NOTES:  # 띄어쓰기 · 문장부호 · 작은 っ · 길게 늘이는 ー는 음표가 아니다
             continue
         c = _hira(c) if language == "ja" else c
         if c in _SMALL and out and _is_kana(out[-1][-1]) and out[-1][-1] not in _SMALL:
@@ -188,6 +191,9 @@ def word_units(ws, language):
         text, owner = "", []
         for i in g:
             t = ws[i][2].strip()
+            if text and t and text[-1].isascii() and text[-1].isalnum() and t[0].isascii() and t[0].isalnum():
+                text += " "  # 영어 단어끼리는 띄어야 한 낱말로 붙지 않는다 (I love you)
+                owner.append(i)
             text += t
             owner += [i] * len(t)
         pos = 0
@@ -215,18 +221,22 @@ def fit(notes, ws, language):
     """음표 목록(시작초, 끝초, 음, 세기[, 가사])에 받아 적은 말을 시간 순서대로 붙인다.
     한 말에 걸친 음표가 음절보다 많으면 남는 음표는 "+"(늘여 부르기), 적으면 긴 음표를 나눈다.
     반환: (가사를 붙인 새 음표 목록, 가사를 붙인 음표 수, 못 붙인 음절 수)."""
-    notes = sorted([list(n[:4]) for n in notes], key=lambda n: (n[0], -n[2]))
+    # 같은 때 시작하는 음표는 내보낼 때 남는 쪽(늦게 끝나는 쪽, 같으면 높은 쪽)이 앞에 오게
+    notes = sorted([list(n[:4]) for n in notes], key=lambda n: (n[0], -n[1], -n[2]))
     lyric = [None] * len(notes)
     splits = {}  # 음표 번호 → 나눌 음절들
     cursor, dropped = 0, 0
     for s, e, units in word_units(ws, language):
         if not units:
             continue
-        cands = [i for i in range(cursor, len(notes)) if notes[i][0] < e - 0.02 and notes[i][1] > s + 0.02]
+        # OpenUtau로 내보낼 때 빠지는 60ms보다 짧은 음표에는 붙이지 않는다
+        cands = [i for i in range(cursor, len(notes))
+                 if notes[i][0] < e - 0.02 and notes[i][1] > s + 0.02 and notes[i][1] - notes[i][0] >= MIN_NOTE]
         # 같은 때 시작하는 화음은 맨 위 음 하나만
         cands = [i for k, i in enumerate(cands) if k == 0 or notes[i][0] - notes[cands[k - 1]][0] > 0.01]
         if not cands:
-            near = next((i for i in range(cursor, len(notes)) if notes[i][0] < e + 0.3 and notes[i][1] > s - 0.3), None)
+            near = next((i for i in range(cursor, len(notes)) if notes[i][0] < e + 0.3 and notes[i][1] > s - 0.3
+                         and notes[i][1] - notes[i][0] >= MIN_NOTE), None)
             if near is None:
                 dropped += len(units)
                 continue
@@ -256,7 +266,7 @@ def fit(notes, ws, language):
     for i, (s, e, p, v) in enumerate(notes):
         if i in splits:
             part = splits[i]
-            pieces = max(1, min(len(part), int((e - s) / 0.06)))  # 60ms보다 짧게는 안 나눈다
+            pieces = max(1, min(len(part), int((e - s) / 0.065)))  # 내보낼 때 빠지지 않게 65ms보다 짧게는 안 나눈다
             if pieces < len(part):  # 너무 짧으면 남는 음절은 마지막 조각에 이어 붙인다
                 part = part[:pieces - 1] + ["".join(part[pieces - 1:])]
             step = (e - s) / len(part)

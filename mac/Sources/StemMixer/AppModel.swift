@@ -993,13 +993,28 @@ final class AppModel: ObservableObject {
         let installed = ["/Applications/OpenUtau.app", NSHomeDirectory() + "/Applications/OpenUtau.app"]
             .map { URL(fileURLWithPath: $0) }.first { FileManager.default.fileExists(atPath: $0.path) }
         let handler = NSWorkspace.shared.urlForApplication(toOpen: ustx)
-        if let app = installed ?? handler.flatMap({ $0.lastPathComponent.lowercased().contains("openutau") ? $0 : nil }) {
-            NSWorkspace.shared.open([ustx], withApplicationAt: app, configuration: NSWorkspace.OpenConfiguration())
-            show("OpenUtau로 열었어요\(note) · 첫 트랙에서 가수를 고르세요")
-        } else {
+        guard let app = installed ?? handler.flatMap({ $0.lastPathComponent.lowercased().contains("openutau") ? $0 : nil })
+        else {
             NSWorkspace.shared.activateFileViewerSelecting([ustx])
             show("OpenUtau 프로젝트를 만들었어요\(note) · project.ustx를 OpenUtau로 여세요")
+            return
         }
+        // OpenUtau는 켜질 때 받은 파일 경로로 프로젝트를 연다. 이미 켜져 있으면 파일을 넘길 방법이 없어서 Finder로 보여 준다.
+        let running = NSWorkspace.shared.runningApplications.contains {
+            $0.bundleURL?.resolvingSymlinksInPath().path == app.resolvingSymlinksInPath().path
+        }
+        if running {
+            NSWorkspace.shared.activateFileViewerSelecting([ustx])
+            show("OpenUtau 프로젝트를 만들었어요\(note) · 켜져 있는 OpenUtau에서 파일 → 열기로 project.ustx를 여세요")
+            return
+        }
+        let config = NSWorkspace.OpenConfiguration()
+        config.arguments = [ustx.path]
+        NSWorkspace.shared.openApplication(at: app, configuration: config) { _, error in
+            guard error != nil else { return }
+            Task { @MainActor in NSWorkspace.shared.activateFileViewerSelecting([ustx]) }
+        }
+        show("OpenUtau를 켜서 열었어요\(note) · 첫 트랙에서 가수를 고르세요")
     }
 
     /// Exports the melody as an OpenUtau / UTAU project to tune with a vocal synth (e.g. Kasane Teto),
