@@ -296,19 +296,9 @@ struct Sidebar: View {
             placeholder(icon: "music.note.list", title: "아직 분리한 곡이 없어요",
                         text: "링크를 붙여넣거나 음악 파일을 끌어다 놓으세요.")
         case .ready:
-            ScrollView {
-                LazyVStack(spacing: 4) {
-                    SectionTitle(title: "최근 분리한 곡", icon: "clock")
-                    ForEach(model.songs) { item in
-                        LibraryRow(item: item, current: model.song?.id == item.id,
-                                   playing: model.playing && model.song?.id == item.id, model: model)
-                            .transition(.opacity.combined(with: .scale(scale: 0.95)))
-                    }
-                }
-                .padding(.horizontal, 8)
-                .padding(.bottom, 8)
-            }
-            .scrollIndicators(.never)
+            LibraryList(items: model.songs, currentID: model.song?.id,
+                        playing: model.playing, model: model)
+                .equatable()
         }
     }
 
@@ -343,6 +333,34 @@ struct Sidebar: View {
         .background(alignment: .top) {
             Rectangle().fill(Color.primary.opacity(0.08)).frame(height: 0.5)
         }
+    }
+}
+
+/// Keeps high-frequency playback updates from rebuilding the scrollable song list.
+private struct LibraryList: View, Equatable {
+    let items: [Song]
+    let currentID: String?
+    let playing: Bool
+    let model: AppModel
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.items == rhs.items && lhs.currentID == rhs.currentID && lhs.playing == rhs.playing
+    }
+
+    var body: some View {
+        ScrollView {
+            LazyVStack(spacing: 4) {
+                SectionTitle(title: "최근 분리한 곡", icon: "clock")
+                ForEach(items) { item in
+                    LibraryRow(item: item, current: currentID == item.id,
+                               playing: playing && currentID == item.id, model: model)
+                        .transition(.opacity.combined(with: .scale(scale: 0.95)))
+                }
+            }
+            .padding(.horizontal, 8)
+            .padding(.bottom, 8)
+        }
+        .scrollIndicators(.never)
     }
 }
 
@@ -441,7 +459,7 @@ struct LibraryRow: View {
     let item: Song
     let current: Bool
     let playing: Bool
-    @ObservedObject var model: AppModel
+    let model: AppModel
 
     @State private var hovering = false
 
