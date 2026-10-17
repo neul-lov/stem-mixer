@@ -3,6 +3,8 @@
 유튜브 링크나 음악 파일을 넣으면 보컬 / 베이스 / 드럼 / 기타 악기로 나누고,
 트랙마다 음량을 0~200%로 조절하며 들을 수 있는 앱입니다. 내 컴퓨터에서 돌아갑니다.
 
+<p align="center"><img src="docs/demo.gif" alt="곡을 재생하며 노래방·드럼만 프리셋과 트랙별 음량을 바꾸는 StemMixer 화면" width="900"></p>
+
 ## Mac 앱 (StemMixer)
 - `mac/` 폴더에 네이티브 Mac 앱이 있어요. 먼저 아래 "실행"대로 한 번 설치(`.venv`)한 뒤
   `mac/build.sh --install` 하면 `/Applications/StemMixer.app` 이 생겨요.
